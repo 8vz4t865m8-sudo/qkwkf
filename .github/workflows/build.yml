@@ -13,34 +13,25 @@ jobs:
       - name: 安装工具
         run: brew install ldid
 
-      - name: 编译绕过dylib
-        run: |
-          clang -arch arm64 \
-            -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
-            -framework Foundation -framework UIKit \
-            -miphoneos-version-min=12.0 -fobjc-arc \
-            -dynamiclib Bypass.m -o Bypass.dylib
-          ldid -S Bypass.dylib
+      - name: 解压IPA
+        run: unzip -q original.ipa -d Unpacked
 
-      - name: 注入dylib
+      - name: 终极干掉校验+干掉验证
         run: |
-          unzip -q original.ipa -d Unpacked
           APP_PATH=$(echo Unpacked/Payload/*.app)
           EXEC_NAME=$(basename $APP_PATH .app)
           
-          cp Bypass.dylib $APP_PATH/
+          # 1. 直接抹掉ShadowTrackerExtra！把类名改成不存在的，它连加载都加载不了！
+          perl -i -pe 's|ShadowTrackerExtra|ShadowTrackerXXXX|g' $APP_PATH/$EXEC_NAME
           
-          # 编译insert_dylib
-          git clone https://github.com/tyilo/insert_dylib
-          cd insert_dylib
-          xcodebuild -target insert_dylib -configuration Release
-          sudo cp build/Release/insert_dylib /usr/local/bin/
-          cd ..
+          # 2. 干掉T3验证服务器
+          perl -i -pe 's|w.t3yanzheng.com|127.0.0.1\x00\x00\x00\x00|g' $APP_PATH/$EXEC_NAME
           
-          insert_dylib --strip-codesig --inplace \
-            "@executable_path/Bypass.dylib" \
-            $APP_PATH/$EXEC_NAME
+          # 3. 所有验证结果默认成功
+          perl -i -pe 's|success\x00\x00\x00\x00|success\x00\x00\x00\x01|g' $APP_PATH/$EXEC_NAME
+          perl -i -pe 's|available\x00\x00\x00\x00|available\x00\x00\x00\x01|g' $APP_PATH/$EXEC_NAME
           
+          # 伪签名
           ldid -S $APP_PATH/$EXEC_NAME
 
       - name: 打包IPA
