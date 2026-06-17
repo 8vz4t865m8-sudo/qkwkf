@@ -13,28 +13,34 @@ jobs:
 
       - name: 安装依赖工具
         run: |
-          brew install ldid make
+          brew install ldid make dpkg
           git clone --recursive https://github.com/theos/theos.git ${{ github.workspace }}/theos
           echo "THEOS=${{ github.workspace }}/theos" >> $GITHUB_ENV
 
-      - name: 编译绕过补丁dylib
+      - name: 编译绕过补丁
         run: |
           make package FINALPACKAGE=1
-          ls -la packages/
+          # 解压deb包提取dylib
+          dpkg -x packages/*.deb deb_extract
+          ls -la deb_extract/Library/MobileSubstrate/DynamicLibraries/
 
       - name: 解压原始IPA
         run: |
           unzip -q original.ipa -d ipa_temp
+          # 列出Payload内容确认目录名
           ls -la ipa_temp/Payload/
 
       - name: 注入dylib到应用
         run: |
-          cp packages/*.dylib ipa_temp/Payload/MyRadar.app/
+          # 复制dylib到APP目录
+          cp deb_extract/Library/MobileSubstrate/DynamicLibraries/*.dylib ipa_temp/Payload/MyRadar.app/
           
+          # 注入加载指令
           $THEOS/bin/insert_dylib @executable_path/T3Bypass_IBOX.dylib \
             ipa_temp/Payload/MyRadar.app/MyRadar \
             --all-yes --strip-codesig
           
+          # 伪签名
           ldid -S ipa_temp/Payload/MyRadar.app/MyRadar
           ldid -S ipa_temp/Payload/MyRadar.app/T3Bypass_IBOX.dylib
 
