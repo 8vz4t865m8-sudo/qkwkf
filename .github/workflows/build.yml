@@ -13,48 +13,33 @@ jobs:
       - name: 解压原始IPA
         run: |
           unzip -q original.ipa -d Unpacked
-          echo "✅ 找到APP:"
-          ls -la Unpacked/Payload/
+          APP_PATH=$(echo Unpacked/Payload/*.app)
+          echo "APP路径: $APP_PATH"
 
-      - name: 编译绕过dylib
+      - name: 编译绕过代码
         run: |
           clang -arch arm64 \
             -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
-            -framework UIKit \
-            -framework Foundation \
-            -miphoneos-version-min=12.0 \
-            -fobjc-arc \
-            -dynamiclib \
-            Bypass.m \
-            -o T3Bypass.dylib
-          echo "✅ Dylib编译完成: $(ls -lh T3Bypass.dylib)"
+            -framework UIKit -framework Foundation \
+            -miphoneos-version-min=12.0 -fobjc-arc \
+            -dynamiclib Bypass.m -o Bypass.dylib
 
-      - name: 注入dylib
+      - name: 只修改Info.plist，完全不碰原可执行文件
         run: |
-          cp T3Bypass.dylib Unpacked/Payload/MyRadar.app/
+          APP_PATH=$(echo Unpacked/Payload/*.app)
+          cp Bypass.dylib $APP_PATH/
           
-          # 编译insert_dylib（和案例一模一样）
-          git clone https://github.com/tyilo/insert_dylib
-          cd insert_dylib
-          xcodebuild -target insert_dylib -configuration Release
-          sudo cp build/Release/insert_dylib /usr/local/bin/
-          cd ..
+          # 只改Info.plist，替换启动入口
+          /usr/libexec/PlistBuddy -c "Set :NSPrincipalClass BypassEntry" $APP_PATH/Info.plist
           
-          insert_dylib --strip-codesig --inplace \
-            "@executable_path/T3Bypass.dylib" \
-            Unpacked/Payload/MyRadar.app/MyRadar
-
-      - name: 签名
-        run: |
+          # 签名
           brew install ldid
-          ldid -S Unpacked/Payload/MyRadar.app/MyRadar
-          ldid -S Unpacked/Payload/MyRadar.app/T3Bypass.dylib
+          ldid -S $APP_PATH/Bypass.dylib
 
       - name: 重新打包IPA
         run: |
           cd Unpacked
           zip -qr ../IBOX-无验证版.ipa .
-          echo "✅ IPA打包完成: $(ls -lh ../IBOX-无验证版.ipa)"
 
       - name: 上传成品
         uses: actions/upload-artifact@v4
