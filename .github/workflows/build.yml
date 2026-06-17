@@ -10,28 +10,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: 先安装工具
+        run: brew install ldid
+
       - name: 解压原始IPA
         run: |
           unzip -q original.ipa -d Unpacked
           APP_PATH=$(echo Unpacked/Payload/*.app)
-          EXEC_NAME=$(ls $APP_PATH | grep -v ".app" | head -1)
-          echo "可执行文件: $APP_PATH/$EXEC_NAME"
+          echo "APP路径: $APP_PATH"
 
-      - name: 直接patch二进制，永久绕过验证
+      - name: Patch二进制绕过验证
         run: |
           APP_PATH=$(echo Unpacked/Payload/*.app)
           EXEC_NAME=$(basename $APP_PATH .app)
           
-          # 直接patch验证方法，让login永远返回success=YES
-          # 找到T3Verify的方法，直接替换返回值
+          # 导出原签名
           ldid -e $APP_PATH/$EXEC_NAME > ents.plist
           
-          # 用sed直接替换二进制里的验证逻辑，把失败改成成功
-          # 这里直接替换T3Result里的success=0为success=1
-          perl -i -pe 's/\x00\x00\x00\x00\x8B\x45\xFC\x85\xC0\x74/\x00\x00\x00\x01\x8B\x45\xFC\x85\xC0\x75/g' $APP_PATH/$EXEC_NAME
+          # 直接patch验证逻辑：把所有验证失败的0改成1
+          perl -i -pe 's/\x00\x00\x00\x00(\x8B\x45\xFC\x85\xC0\x74)/\x00\x00\x00\x01$1/g' $APP_PATH/$EXEC_NAME
           
-          # 重新签名
-          brew install ldid
+          # 恢复签名
           ldid -Sents.plist $APP_PATH/$EXEC_NAME
 
       - name: 重新打包IPA
