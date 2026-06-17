@@ -24,15 +24,14 @@ jobs:
             -miphoneos-version-min=12.0 -fobjc-arc \
             -dynamiclib Bypass.m -o Bypass.dylib
 
-      - name: 只修改Info.plist，完全不碰原可执行文件
+      - name: 修改Info.plist
         run: |
           APP_PATH=$(echo Unpacked/Payload/*.app)
           cp Bypass.dylib $APP_PATH/
           
-          # 只改Info.plist，替换启动入口
-          /usr/libexec/PlistBuddy -c "Set :NSPrincipalClass BypassEntry" $APP_PATH/Info.plist
+          # 先添加字段，再赋值
+          /usr/libexec/PlistBuddy -c "Add :NSPrincipalClass string BypassEntry" $APP_PATH/Info.plist
           
-          # 签名
           brew install ldid
           ldid -S $APP_PATH/Bypass.dylib
 
