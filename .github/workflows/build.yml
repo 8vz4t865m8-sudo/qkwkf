@@ -14,26 +14,25 @@ jobs:
         run: |
           unzip -q original.ipa -d Unpacked
           APP_PATH=$(echo Unpacked/Payload/*.app)
-          echo "APP路径: $APP_PATH"
+          EXEC_NAME=$(ls $APP_PATH | grep -v ".app" | head -1)
+          echo "可执行文件: $APP_PATH/$EXEC_NAME"
 
-      - name: 编译绕过代码
-        run: |
-          clang -arch arm64 \
-            -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
-            -framework UIKit -framework Foundation \
-            -miphoneos-version-min=12.0 -fobjc-arc \
-            -dynamiclib Bypass.m -o Bypass.dylib
-
-      - name: 修改Info.plist
+      - name: 直接patch二进制，永久绕过验证
         run: |
           APP_PATH=$(echo Unpacked/Payload/*.app)
-          cp Bypass.dylib $APP_PATH/
+          EXEC_NAME=$(basename $APP_PATH .app)
           
-          # 先添加字段，再赋值
-          /usr/libexec/PlistBuddy -c "Add :NSPrincipalClass string BypassEntry" $APP_PATH/Info.plist
+          # 直接patch验证方法，让login永远返回success=YES
+          # 找到T3Verify的方法，直接替换返回值
+          ldid -e $APP_PATH/$EXEC_NAME > ents.plist
           
+          # 用sed直接替换二进制里的验证逻辑，把失败改成成功
+          # 这里直接替换T3Result里的success=0为success=1
+          perl -i -pe 's/\x00\x00\x00\x00\x8B\x45\xFC\x85\xC0\x74/\x00\x00\x00\x01\x8B\x45\xFC\x85\xC0\x75/g' $APP_PATH/$EXEC_NAME
+          
+          # 重新签名
           brew install ldid
-          ldid -S $APP_PATH/Bypass.dylib
+          ldid -Sents.plist $APP_PATH/$EXEC_NAME
 
       - name: 重新打包IPA
         run: |
