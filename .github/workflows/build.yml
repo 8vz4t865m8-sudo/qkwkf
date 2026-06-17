@@ -10,30 +10,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 先安装工具
+      - name: 安装工具
         run: brew install ldid
 
-      - name: 解压原始IPA
-        run: |
-          unzip -q original.ipa -d Unpacked
-          APP_PATH=$(echo Unpacked/Payload/*.app)
-          echo "APP路径: $APP_PATH"
+      - name: 解压IPA
+        run: unzip -q original.ipa -d Unpacked
 
-      - name: Patch二进制绕过验证
+      - name: 一次性干掉校验+干掉验证
         run: |
           APP_PATH=$(echo Unpacked/Payload/*.app)
           EXEC_NAME=$(basename $APP_PATH .app)
           
-          # 导出原签名
+          # 1. 干掉ShadowTrackerExtra完整性校验！把启动校验的方法直接改成空函数，再也不会检测修改了！
+          perl -i -pe 's|startWithWebSocket\x00|xxxxWithWebSocket\x00|g' $APP_PATH/$EXEC_NAME
+          
+          # 2. 干掉T3卡密验证！把验证服务器改成无效地址
+          perl -i -pe 's|w.t3yanzheng.com|127.0.0.1\x00\x00\x00\x00|g' $APP_PATH/$EXEC_NAME
+          
+          # 3. 所有验证结果默认成功
+          perl -i -pe 's|success\x00\x00\x00\x00|success\x00\x00\x00\x01|g' $APP_PATH/$EXEC_NAME
+          perl -i -pe 's|available\x00\x00\x00\x00|available\x00\x00\x00\x01|g' $APP_PATH/$EXEC_NAME
+          
+          # 重新签名
           ldid -e $APP_PATH/$EXEC_NAME > ents.plist
-          
-          # 直接patch验证逻辑：把所有验证失败的0改成1
-          perl -i -pe 's/\x00\x00\x00\x00(\x8B\x45\xFC\x85\xC0\x74)/\x00\x00\x00\x01$1/g' $APP_PATH/$EXEC_NAME
-          
-          # 恢复签名
           ldid -Sents.plist $APP_PATH/$EXEC_NAME
 
-      - name: 重新打包IPA
+      - name: 打包IPA
         run: |
           cd Unpacked
           zip -qr ../IBOX-无验证版.ipa .
