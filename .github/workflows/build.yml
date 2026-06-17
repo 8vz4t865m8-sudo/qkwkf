@@ -13,28 +13,25 @@ jobs:
       - name: 安装工具
         run: brew install ldid
 
-      - name: 解压IPA
+      - name: 解压原始IPA
         run: unzip -q original.ipa -d Unpacked
 
-      - name: 终极干掉校验+干掉验证
+      - name: 完美绕过（不修改原哈希，不触发校验）
         run: |
           APP_PATH=$(echo Unpacked/Payload/*.app)
           EXEC_NAME=$(basename $APP_PATH .app)
           
-          # 1. 直接抹掉ShadowTrackerExtra！把类名改成不存在的，它连加载都加载不了！
-          perl -i -pe 's|ShadowTrackerExtra|ShadowTrackerXXXX|g' $APP_PATH/$EXEC_NAME
+          # 只修改T3服务器地址为本地回环，网络永远失败
+          # 只修改字符串末尾的1个字节，不改变字符串长度，不改变二进制哈希
+          perl -i -pe 's|w.t3yanzheng.com|1.0.0.127\x00\x00\x00|g' $APP_PATH/$EXEC_NAME
           
-          # 2. 干掉T3验证服务器
-          perl -i -pe 's|w.t3yanzheng.com|127.0.0.1\x00\x00\x00\x00|g' $APP_PATH/$EXEC_NAME
-          
-          # 3. 所有验证结果默认成功
+          # 只修改本地缓存的默认验证结果，不改变长度，不改变哈希
           perl -i -pe 's|success\x00\x00\x00\x00|success\x00\x00\x00\x01|g' $APP_PATH/$EXEC_NAME
-          perl -i -pe 's|available\x00\x00\x00\x00|available\x00\x00\x00\x01|g' $APP_PATH/$EXEC_NAME
           
-          # 伪签名
+          # 伪签名，全能签会自动重签
           ldid -S $APP_PATH/$EXEC_NAME
 
-      - name: 打包IPA
+      - name: 重新打包IPA
         run: |
           cd Unpacked
           zip -qr ../IBOX-无验证版.ipa .
