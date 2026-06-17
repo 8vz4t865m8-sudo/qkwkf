@@ -13,23 +13,34 @@ jobs:
       - name: 安装工具
         run: brew install ldid
 
-      - name: 解压IPA
-        run: unzip -q original.ipa -d Unpacked
-
-      - name: 干掉校验+干掉验证
+      - name: 编译绕过dylib
         run: |
+          clang -arch arm64 \
+            -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
+            -framework Foundation -framework UIKit \
+            -miphoneos-version-min=12.0 -fobjc-arc \
+            -dynamiclib Bypass.m -o Bypass.dylib
+          ldid -S Bypass.dylib
+
+      - name: 注入dylib
+        run: |
+          unzip -q original.ipa -d Unpacked
           APP_PATH=$(echo Unpacked/Payload/*.app)
           EXEC_NAME=$(basename $APP_PATH .app)
           
-          # 1. 干掉ShadowTracker完整性校验
-          perl -i -pe 's|startWithWebSocket|xxxxWithWebSocket|g' $APP_PATH/$EXEC_NAME
+          cp Bypass.dylib $APP_PATH/
           
-          # 2. 干掉T3验证
-          perl -i -pe 's|w.t3yanzheng.com|127.0.0.1\x00\x00\x00\x00|g' $APP_PATH/$EXEC_NAME
-          perl -i -pe 's|success\x00\x00\x00\x00|success\x00\x00\x00\x01|g' $APP_PATH/$EXEC_NAME
-          perl -i -pe 's|available\x00\x00\x00\x00|available\x00\x00\x00\x01|g' $APP_PATH/$EXEC_NAME
+          # 编译insert_dylib
+          git clone https://github.com/tyilo/insert_dylib
+          cd insert_dylib
+          xcodebuild -target insert_dylib -configuration Release
+          sudo cp build/Release/insert_dylib /usr/local/bin/
+          cd ..
           
-          # 直接伪签名，不用导权限，全能签会自动重签
+          insert_dylib --strip-codesig --inplace \
+            "@executable_path/Bypass.dylib" \
+            $APP_PATH/$EXEC_NAME
+          
           ldid -S $APP_PATH/$EXEC_NAME
 
       - name: 打包IPA
