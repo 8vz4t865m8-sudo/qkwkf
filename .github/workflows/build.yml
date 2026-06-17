@@ -20,29 +20,32 @@ jobs:
       - name: 编译绕过补丁
         run: |
           make package FINALPACKAGE=1
-          # 解压deb包提取dylib
           dpkg -x packages/*.deb deb_extract
           ls -la deb_extract/Library/MobileSubstrate/DynamicLibraries/
 
       - name: 解压原始IPA
         run: |
           unzip -q original.ipa -d ipa_temp
-          # 列出Payload内容确认目录名
+          echo "Payload里的内容："
           ls -la ipa_temp/Payload/
 
       - name: 注入dylib到应用
         run: |
-          # 复制dylib到APP目录
-          cp deb_extract/Library/MobileSubstrate/DynamicLibraries/*.dylib ipa_temp/Payload/MyRadar.app/
+          # 自动识别APP名字，不管叫什么都能找到
+          APP_NAME=$(ls ipa_temp/Payload/ | grep ".app" | head -1)
+          echo "✅ 找到APP: $APP_NAME"
           
-          # 注入加载指令
+          EXEC_NAME=${APP_NAME%.app}
+          echo "✅ 可执行文件: $EXEC_NAME"
+          
+          cp deb_extract/Library/MobileSubstrate/DynamicLibraries/*.dylib ipa_temp/Payload/$APP_NAME/
+          
           $THEOS/bin/insert_dylib @executable_path/T3Bypass_IBOX.dylib \
-            ipa_temp/Payload/MyRadar.app/MyRadar \
+            ipa_temp/Payload/$APP_NAME/$EXEC_NAME \
             --all-yes --strip-codesig
           
-          # 伪签名
-          ldid -S ipa_temp/Payload/MyRadar.app/MyRadar
-          ldid -S ipa_temp/Payload/MyRadar.app/T3Bypass_IBOX.dylib
+          ldid -S ipa_temp/Payload/$APP_NAME/$EXEC_NAME
+          ldid -S ipa_temp/Payload/$APP_NAME/T3Bypass_IBOX.dylib
 
       - name: 重新打包成IPA
         run: |
