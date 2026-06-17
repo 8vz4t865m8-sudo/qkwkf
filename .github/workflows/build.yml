@@ -11,9 +11,9 @@ jobs:
       - name: 拉取仓库代码
         uses: actions/checkout@v4
 
-      - name: 安装依赖工具
+      - name: 安装所有依赖工具
         run: |
-          brew install ldid make dpkg
+          brew install ldid make dpkg insert-dylib
           git clone --recursive https://github.com/theos/theos.git ${{ github.workspace }}/theos
           echo "THEOS=${{ github.workspace }}/theos" >> $GITHUB_ENV
 
@@ -26,21 +26,20 @@ jobs:
       - name: 解压原始IPA
         run: |
           unzip -q original.ipa -d ipa_temp
-          echo "Payload里的内容："
+          echo "✅ 找到APP:"
           ls -la ipa_temp/Payload/
 
       - name: 注入dylib到应用
         run: |
-          # 自动识别APP名字，不管叫什么都能找到
           APP_NAME=$(ls ipa_temp/Payload/ | grep ".app" | head -1)
-          echo "✅ 找到APP: $APP_NAME"
-          
           EXEC_NAME=${APP_NAME%.app}
+          echo "✅ APP: $APP_NAME"
           echo "✅ 可执行文件: $EXEC_NAME"
           
           cp deb_extract/Library/MobileSubstrate/DynamicLibraries/*.dylib ipa_temp/Payload/$APP_NAME/
           
-          $THEOS/bin/insert_dylib @executable_path/T3Bypass_IBOX.dylib \
+          # 用brew安装的insert_dylib，绝对不会找不到
+          insert-dylib @executable_path/T3Bypass_IBOX.dylib \
             ipa_temp/Payload/$APP_NAME/$EXEC_NAME \
             --all-yes --strip-codesig
           
