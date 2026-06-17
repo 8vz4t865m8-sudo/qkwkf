@@ -16,24 +16,21 @@ jobs:
       - name: 解压IPA
         run: unzip -q original.ipa -d Unpacked
 
-      - name: 一次性干掉校验+干掉验证
+      - name: 干掉校验+干掉验证
         run: |
           APP_PATH=$(echo Unpacked/Payload/*.app)
           EXEC_NAME=$(basename $APP_PATH .app)
           
-          # 1. 干掉ShadowTrackerExtra完整性校验！把启动校验的方法直接改成空函数，再也不会检测修改了！
-          perl -i -pe 's|startWithWebSocket\x00|xxxxWithWebSocket\x00|g' $APP_PATH/$EXEC_NAME
+          # 1. 干掉ShadowTracker完整性校验
+          perl -i -pe 's|startWithWebSocket|xxxxWithWebSocket|g' $APP_PATH/$EXEC_NAME
           
-          # 2. 干掉T3卡密验证！把验证服务器改成无效地址
+          # 2. 干掉T3验证
           perl -i -pe 's|w.t3yanzheng.com|127.0.0.1\x00\x00\x00\x00|g' $APP_PATH/$EXEC_NAME
-          
-          # 3. 所有验证结果默认成功
           perl -i -pe 's|success\x00\x00\x00\x00|success\x00\x00\x00\x01|g' $APP_PATH/$EXEC_NAME
           perl -i -pe 's|available\x00\x00\x00\x00|available\x00\x00\x00\x01|g' $APP_PATH/$EXEC_NAME
           
-          # 重新签名
-          ldid -e $APP_PATH/$EXEC_NAME > ents.plist
-          ldid -Sents.plist $APP_PATH/$EXEC_NAME
+          # 直接伪签名，不用导权限，全能签会自动重签
+          ldid -S $APP_PATH/$EXEC_NAME
 
       - name: 打包IPA
         run: |
