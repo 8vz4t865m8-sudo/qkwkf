@@ -1,0 +1,9 @@
+Package: com.ibox.bypass
+Name: T3Bypass_IBOX
+Version: 1.0
+Architecture: iphoneos-arm64
+Description: IBOX高系统雷达T3验证绕过
+Maintainer: Bypass
+Author: Bypass
+Section: Tweaks
+Depends: mobilesubstrate
