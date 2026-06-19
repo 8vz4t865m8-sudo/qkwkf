@@ -14,21 +14,24 @@ jobs:
           echo "THEOS=${{ github.workspace }}/theos" >> $GITHUB_ENV
           echo "✅ Theos 安装完成"
 
-      # 第二步：安装工具（用 brew，自动解决依赖）
+      # 第二步：安装工具
       - name: 安装注入工具
         run: |
-          # 安装 ldid（用 brew，自动解决依赖）
+          # 安装 ldid（用 brew）
           brew install ldid
           
-          # 安装 optool（优先 brew，失败再自己编译）
-          brew install opa334/optool/optool 2>/dev/null || (
-            git clone https://github.com/alexzielenski/optool.git
-            cd optool && make && sudo cp optool /usr/local/bin/ && cd ..
+          # 直接下载预编译好的 optool（不用自己编译）
+          curl -L -o /usr/local/bin/optool "https://github.com/alexzielenski/optool/releases/download/1.0.0/optool" 2>/dev/null || (
+            # 如果上面的链接不行，就用 insert_dylib 替代
+            echo "optool 下载失败，使用 insert_dylib 替代"
+            git clone https://github.com/Tyilo/insert_dylib.git
+            cd insert_dylib && make && sudo cp insert_dylib /usr/local/bin/ && cd ..
           )
+          chmod +x /usr/local/bin/optool 2>/dev/null || true
           
           echo "✅ 工具安装完成"
-          which optool
           which ldid
+          which optool || which insert_dylib
 
       # 第三步：编译 dylib
       - name: 编译 dylib
@@ -55,7 +58,7 @@ jobs:
           APP_NAME=$(ls temp/Payload/ | grep ".app" | head -1)
           echo "✅ 找到 APP: $APP_NAME"
           
-          # 找主二进制（自动识别）
+          # 找主二进制
           BIN_NAME=$(ls "temp/Payload/$APP_NAME/" | grep -v ".dylib" | grep -v ".nib" | grep -v ".plist" | grep -v ".png" | grep -v ".lproj" | grep -v "_CodeSignature" | grep -v "Assets" | head -1)
           echo "✅ 主二进制: $BIN_NAME"
           
@@ -63,9 +66,17 @@ jobs:
           cp .theos/obj/debug/IBOXBypass.dylib "temp/Payload/$APP_NAME/"
           echo "✅ dylib 复制完成"
           
-          # 注入加载命令
-          optool install -c load -p "@executable_path/IBOXBypass.dylib" -t "temp/Payload/$APP_NAME/$BIN_NAME"
-          echo "✅ 加载命令注入完成"
+          # 注入加载命令（优先 optool，失败用 insert_dylib）
+          if command -v optool &> /dev/null; then
+            optool install -c load -p "@executable_path/IBOXBypass.dylib" -t "temp/Payload/$APP_NAME/$BIN_NAME"
+            echo "✅ optool 注入完成"
+          elif command -v insert_dylib &> /dev/null; then
+            insert_dylib --inplace "@executable_path/IBOXBypass.dylib" "temp/Payload/$APP_NAME/$BIN_NAME"
+            echo "✅ insert_dylib 注入完成"
+          else
+            echo "❌ 没有可用的注入工具！"
+            exit 1
+          fi
           
           # 重新签名
           ldid -S "temp/Payload/$APP_NAME/$BIN_NAME"
