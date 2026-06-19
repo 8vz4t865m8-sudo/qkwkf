@@ -1,4 +1,4 @@
-name: 自动构建注入版 IPA
+name: 自动构建绕过版 IPA
 on: [push, workflow_dispatch]
 
 jobs:
@@ -10,45 +10,14 @@ jobs:
       # 第一步：安装工具
       - name: 安装工具
         run: |
-          echo "=== 系统信息 ==="
-          sw_vers
-          xcrun --sdk iphoneos --show-sdk-version
-          
-          echo "=== 安装 ldid ==="
           brew install ldid
-          
-          echo "=== 工具检查 ==="
-          which ldid
-          which python3
           echo "✅ 工具安装完成"
 
-      # 第二步：编译 dylib
-      - name: 编译 dylib
-        run: |
-          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          CLANG=$(xcrun --sdk iphoneos -f clang)
-          
-          echo "SDK: $SDK"
-          echo "编译器: $CLANG"
-          
-          $CLANG -arch arm64 -isysroot $SDK -dynamiclib \
-              -o IBOXBypass.dylib \
-              Tweak.m fishhook.c \
-              -fobjc-arc \
-              -framework Foundation \
-              -framework UIKit \
-              -miphoneos-version-min=15.0
-          
-          ldid -S IBOXBypass.dylib
-          ls -lh IBOXBypass.dylib
-          file IBOXBypass.dylib
-          echo "✅ dylib 编译完成"
-
-      # 第三步：注入 dylib（纯 Python 手动写 Mach-O）
-      - name: 注入 dylib
+      # 第二步：Patch 主二进制（废掉所有崩溃调用）
+      - name: Patch 主二进制
         run: |
           if [ ! -f "original.ipa" ]; then
-            echo "❌ 错误：仓库根目录找不到 original.ipa！"
+            echo "❌ 找不到 original.ipa"
             exit 1
           fi
           
@@ -56,9 +25,9 @@ jobs:
           echo "✅ IPA 解压完成"
           
           APP_NAME=$(ls temp/Payload/ | grep "\.app$" | head -1)
-          echo "✅ APP: $APP_NAME"
-          
           BIN_PATH="temp/Payload/$APP_NAME"
+          
+          # 找主二进制
           BIN_NAME=""
           for f in "$BIN_PATH"/*; do
             if file "$f" | grep -q "Mach-O" && [ ! -d "$f" ]; then
@@ -68,15 +37,12 @@ jobs:
           done
           echo "✅ 主二进制: $BIN_NAME"
           
-          cp IBOXBypass.dylib "$BIN_PATH/"
-          echo "✅ dylib 复制完成"
-          
-          # 纯 Python 手动注入 LC_LOAD_DYLIB
-          python3 << 'EOF'
+          # 运行 Python Patch 脚本
+          python3 << 'PYEOF'
           import os
           import struct
           
-          # 找主二进制
+          # ========== 找主二进制文件 ==========
           app_dir = "temp/Payload"
           app_name = [d for d in os.listdir(app_dir) if d.endswith(".app")][0]
           bin_path = os.path.join(app_dir, app_name)
@@ -92,83 +58,130 @@ jobs:
                           break
           
           full_path = os.path.join(bin_path, bin_name)
-          print(f"处理: {full_path}")
+          print(f"处理文件: {full_path}")
           
-          # 读取文件
+          # ========== 读取 Mach-O ==========
           with open(full_path, 'rb') as f:
               data = bytearray(f.read())
           
-          # 解析 Mach-O 头 (32 bytes for 64-bit)
-          magic, cputype, cpusubtype, filetype, ncmds, sizeofcmds, flags, reserved = struct.unpack_from('<IIIIIIII', data, 0)
+          print(f"文件大小: {len(data)} 字节")
           
-          print(f"Magic: {hex(magic)}")
-          print(f"CPU: {cputype}")
+          # 解析 Mach-O 64 头
+          magic, cputype, cpusubtype, filetype, ncmds, sizeofcmds, flags, reserved = struct.unpack_from('<IIIIIIII', data, 0)
           print(f"加载命令数量: {ncmds}")
           print(f"加载命令总大小: {sizeofcmds}")
           
-          # 要添加的 dylib 路径
-          dylib_path = "@executable_path/IBOXBypass.dylib"
-          path_bytes = dylib_path.encode('utf-8') + b'\x00'
+          # ========== 遍历加载命令 ==========
+          text_vmaddr = 0
+          text_fileoff = 0
+          text_size = 0
+          symtab_off = 0
+          symtab_nsyms = 0
+          symtab_stroff = 0
+          symtab_strsize = 0
           
-          # LC_LOAD_DYLIB 命令结构
-          # cmd (4) + cmdsize (4) + offset (4) + timestamp (4) + current_version (4) + compatibility_version (4) + path
-          path_offset = 24  # 从命令开始到路径字符串的偏移
-          cmdsize = path_offset + len(path_bytes)
-          # 对齐到 8 字节
-          if cmdsize % 8 != 0:
-              cmdsize += 8 - (cmdsize % 8)
-              path_bytes = path_bytes + b'\x00' * (cmdsize - path_offset - len(path_bytes))
+          offset = 32  # 64-bit header size
+          for i in range(ncmds):
+              cmd, cmdsize = struct.unpack_from('<II', data, offset)
+              
+              if cmd == 0x19:  # LC_SEGMENT_64
+                  segname, vmaddr, vmsize, fileoff, filesize, maxprot, initprot, nsects, flags = struct.unpack_from('<16sQQQQIIII', data, offset + 8)
+                  segname = segname.decode('utf-8', errors='replace').rstrip('\x00')
+                  
+                  if segname == '__TEXT':
+                      text_vmaddr = vmaddr
+                      text_fileoff = fileoff
+                      text_size = filesize
+                      print(f"找到 __TEXT 段: vmaddr={hex(vmaddr)}, fileoff={hex(fileoff)}, size={hex(filesize)}")
+              
+              elif cmd == 0x2:  # LC_SYMTAB
+                  symoff, nsyms, stroff, strsize = struct.unpack_from('<IIII', data, offset + 8)
+                  symtab_off = symoff
+                  symtab_nsyms = nsyms
+                  symtab_stroff = stroff
+                  symtab_strsize = strsize
+                  print(f"找到符号表: off={hex(symoff)}, nsyms={nsyms}, stroff={hex(stroff)}, strsize={strsize}")
+              
+              offset += cmdsize
           
-          # 构造加载命令
-          LC_LOAD_DYLIB = 0xC
-          cmd_data = struct.pack('<IIIIII', 
-              LC_LOAD_DYLIB,  # cmd
-              cmdsize,        # cmdsize
-              path_offset,    # offset (到路径的偏移)
-              0,              # timestamp
-              0x00010000,     # current_version (1.0.0)
-              0x00010000      # compatibility_version (1.0.0)
-          ) + path_bytes
+          # ========== 解析符号表，找崩溃函数 ==========
+          crash_funcs = {}
+          target_names = ['_exit', '_abort', '_kill', '_raise', '__assert_rtn', '_objc_exception_throw', '__pthread_exit']
           
-          print(f"新命令大小: {cmdsize}")
+          print("\n查找崩溃函数符号...")
           
-          # 找到加载命令的结束位置（在第 28 字节之后 sizeofcmds 字节）
-          cmds_start = 32  # 64-bit header is 32 bytes
-          cmds_end = cmds_start + sizeofcmds
+          for i in range(symtab_nsyms):
+              sym_off = symtab_off + i * 16  # nlist_64 is 16 bytes
+              n_strx, n_type, n_sect, n_desc, n_value = struct.unpack_from('<IBBHQ', data, sym_off)
+              
+              if n_strx > 0 and n_strx < symtab_strsize:
+                  name_end = data.find(b'\x00', symtab_stroff + n_strx)
+                  if name_end > 0:
+                      name = data[symtab_stroff + n_strx:name_end].decode('utf-8', errors='replace')
+                      
+                      if name in target_names:
+                          crash_funcs[name] = n_value
+                          print(f"  找到 {name}: {hex(n_value)}")
           
-          # 在加载命令末尾插入新命令
-          new_data = data[:cmds_end] + cmd_data + data[cmds_end:]
+          print(f"\n共找到 {len(crash_funcs)} 个崩溃函数")
           
-          # 更新头里的 ncmds 和 sizeofcmds
-          struct.pack_into('<I', new_data, 16, ncmds + 1)      # ncmds
-          struct.pack_into('<I', new_data, 20, sizeofcmds + cmdsize)  # sizeofcmds
+          # ========== 遍历代码段，NOP 所有 bl 崩溃函数 ==========
+          print("\n开始 NOP 崩溃函数调用...")
           
-          # 写回文件
+          text_start_file = text_fileoff
+          text_end_file = text_fileoff + text_size
+          text_start_vm = text_vmaddr
+          
+          nop_count = 0
+          
+          # 遍历每条指令（4字节）
+          pos = text_start_file
+          while pos < text_end_file - 4:
+              instr = struct.unpack_from('<I', data, pos)[0]
+              
+              # 判断是不是 bl 指令
+              # ARM64 bl: 最高6位是 100101 (0x94 >> 26 = 0x25 = 100101)
+              if (instr >> 26) == 0x25:
+                  # 计算目标地址
+                  imm26 = instr & 0x03FFFFFF
+                  # 有符号扩展
+                  if imm26 & 0x02000000:
+                      imm26 -= 0x04000000
+                  
+                  target_vm = text_start_vm + (pos - text_start_file) + (imm26 << 2)
+                  target_vm &= 0xFFFFFFFF
+                  
+                  # 检查是不是崩溃函数
+                  for name, addr in crash_funcs.items():
+                      if target_vm == addr:
+                          # NOP 掉
+                          struct.pack_into('<I', data, pos, 0xD503201F)  # NOP
+                          nop_count += 1
+                          print(f"  NOP {name} 在文件偏移 {hex(pos)} (VM {hex(target_vm)})")
+                          break
+              
+              pos += 4
+          
+          print(f"\n共 NOP 了 {nop_count} 处崩溃调用")
+          
+          # ========== 写回文件 ==========
           with open(full_path, 'wb') as f:
-              f.write(new_data)
+              f.write(data)
           
-          print("✅ 加载命令注入完成")
-          EOF
+          print("\n✅ Patch 完成！")
+          PYEOF
           
-          echo "=== 验证注入结果 ==="
-          otool -L "$BIN_PATH/$BIN_NAME" | head -20
-          
+          # 重新签名
           ldid -S "$BIN_PATH/$BIN_NAME"
-          ldid -S "$BIN_PATH/IBOXBypass.dylib"
           echo "✅ 重新签名完成"
           
-          cd temp && zip -qr ../IBOX_已绕过验证.ipa Payload && cd ..
-          ls -lh IBOX_已绕过验证.ipa
+          # 重新打包
+          cd temp && zip -qr ../IBOX_已废掉崩溃.ipa Payload && cd ..
+          ls -lh IBOX_已废掉崩溃.ipa
           echo "✅ 最终 IPA 打包完成"
 
       - name: 上传最终 IPA
         uses: actions/upload-artifact@v4
         with:
-          name: IBOX_已绕过验证.ipa
-          path: IBOX_已绕过验证.ipa
-
-      - name: 上传 dylib
-        uses: actions/upload-artifact@v4
-        with:
-          name: IBOXBypass.dylib
-          path: IBOXBypass.dylib
+          name: IBOX_已废掉崩溃.ipa
+          path: IBOX_已废掉崩溃.ipa
