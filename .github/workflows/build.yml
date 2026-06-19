@@ -39,7 +39,7 @@ jobs:
           FULL_BIN="$BIN_PATH/$BIN_NAME"
           
           # ============================================
-          # 第一部分：废掉所有崩溃调用（跟之前一样）
+          # 第一部分：废掉所有崩溃调用
           # ============================================
           echo ""
           echo "=== 第一步：废掉所有崩溃调用 ==="
@@ -99,22 +99,31 @@ jobs:
               
               offset += cmdsize
           
-          # 找崩溃函数符号
+          # 找崩溃函数符号（多试几个名字）
           crash_funcs = {}
-          target_names = ['_exit', '_abort', '_kill', '_raise', '__assert_rtn', '_objc_exception_throw', '__pthread_exit']
+          target_names = [
+              '_exit', 'exit',
+              '_abort', 'abort',
+              '_kill', 'kill',
+              '_raise', 'raise',
+              '__assert_rtn',
+              '_objc_exception_throw', 'objc_exception_throw',
+          ]
           
+          print("找到的符号：")
           for i in range(symtab_nsyms):
               sym_off = symtab_off + i * 16
               n_strx, n_type, n_sect, n_desc, n_value = struct.unpack_from('<IBBHQ', data, sym_off)
               
-              if n_strx > 0 and n_strx < symtab_strsize:
+              if n_strx > 0 and n_strx < symtab_strsize and n_value > 0:
                   name_end = data.find(b'\x00', symtab_stroff + n_strx)
                   if name_end > 0:
                       name = data[symtab_stroff + n_strx:name_end].decode('utf-8', errors='replace')
                       if name in target_names:
                           crash_funcs[name] = n_value
+                          print(f"  {name}: {hex(n_value)}")
           
-          print(f"找到 {len(crash_funcs)} 个崩溃函数")
+          print(f"\n共找到 {len(crash_funcs)} 个崩溃函数")
           
           # NOP 所有崩溃调用
           text_start_file = text_fileoff
@@ -160,7 +169,7 @@ jobs:
           otool -ov "$FULL_BIN" > /tmp/objc_methods.txt
           echo "✅ 已导出 ObjC 方法列表"
           
-          # 解析方法列表，找到 ViewController 的方法
+          # 直接搜索方法名，不用找类
           python3 << 'PYEOF2'
           import os
           import re
@@ -186,7 +195,7 @@ jobs:
           with open(full_path, 'rb') as f:
               data = bytearray(f.read())
           
-          # 找 __TEXT 段信息（用于 VM 地址转文件偏移）
+          # 找 __TEXT 段信息
           text_vmaddr = 0
           text_fileoff = 0
           
@@ -205,39 +214,37 @@ jobs:
           def vm_to_file(vm_addr):
               return int(vm_addr - text_vmaddr + text_fileoff)
           
-          # 解析 otool 输出
+          # 读取 otool 输出
           with open('/tmp/objc_methods.txt', 'r') as f:
               content = f.read()
           
-          # 找 ViewController 类
-          vc_match = re.search(r'class name: ViewController.*?instance methods:(.*?)(?=\n\s*\n|\Z)', content, re.DOTALL)
-          if not vc_match:
-              print("❌ 找不到 ViewController 类")
-              exit(1)
-          
-          vc_methods = vc_match.group(1)
-          
-          # 提取方法名和 imp 地址
-          methods = {}
-          method_pattern = r'name:\s+(\S+).*?imp:\s+0x([0-9a-fA-F]+)'
-          for match in re.finditer(method_pattern, vc_methods, re.DOTALL):
-              name = match.group(1)
-              imp = int(match.group(2), 16)
-              methods[name] = imp
-              print(f"  方法: {name} @ {hex(imp)}")
+          # 直接搜索每个方法的 name 和 imp
+          def find_method_imp(method_name):
+              # 找 "name: 方法名" 后面跟着的 imp
+              pattern = r'name:\s+' + re.escape(method_name) + r'\s+types:\s+\S+\s+imp:\s+0x([0-9a-fA-F]+)'
+              match = re.search(pattern, content)
+              if match:
+                  return int(match.group(1), 16)
+              return None
           
           # 找我们需要的方法
-          needed = ['onVerify', 'tryAutoLogin:', 'doHeartbeat', 'enterMainConsole']
+          methods_to_find = ['onVerify', 'tryAutoLogin:', 'doHeartbeat', 'enterMainConsole']
           addrs = {}
-          for name in needed:
-              if name in methods:
-                  addrs[name] = methods[name]
-                  print(f"\n✅ 找到 {name}: {hex(addrs[name])}")
+          
+          for name in methods_to_find:
+              imp = find_method_imp(name)
+              if imp:
+                  addrs[name] = imp
+                  print(f"✅ 找到 {name}: {hex(imp)}")
               else:
-                  print(f"\n❌ 找不到 {name}")
+                  print(f"❌ 找不到 {name}")
           
           if len(addrs) < 3:
-              print("❌ 关键方法缺失，无法继续")
+              # 打印前 100 行看看格式
+              print("\n=== otool 输出前 100 行 ===")
+              lines = content.split('\n')[:100]
+              for i, line in enumerate(lines):
+                  print(f"{i+1}: {line}")
               exit(1)
           
           # ============================================
@@ -247,11 +254,8 @@ jobs:
           # 1. onVerify → 直接跳转到 enterMainConsole
           if 'onVerify' in addrs and 'enterMainConsole' in addrs:
               onverify_file = vm_to_file(addrs['onVerify'])
-              enter_file = addrs['enterMainConsole']
               
-              # 计算 b 指令的偏移
-              # ARM64 b 指令: 0x14000000 | (imm26 & 0x03FFFFFF)
-              # 偏移 = (目标 - 当前) >> 2
+              # 计算 b 指令偏移
               offset_bytes = (addrs['enterMainConsole'] - addrs['onVerify']) >> 2
               if offset_bytes < 0:
                   offset_bytes += (1 << 26)
@@ -299,3 +303,4 @@ jobs:
         with:
           name: IBOX_已绕过验证.ipa
           path: IBOX_已绕过验证.ipa
+          
