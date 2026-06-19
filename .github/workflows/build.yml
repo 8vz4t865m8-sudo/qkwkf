@@ -12,31 +12,43 @@ jobs:
         run: |
           echo "=== 系统信息 ==="
           sw_vers
-          xcodebuild -version 2>/dev/null || true
-          xcrun --sdk iphoneos --show-sdk-version 2>/dev/null || true
+          xcrun --sdk iphoneos --show-sdk-version
           
           echo "=== 安装 ldid ==="
           brew install ldid
           
-          echo "=== 安装 insert_dylib（更稳定） ==="
-          git clone https://github.com/Tyilo/insert_dylib.git
-          cd insert_dylib && make && sudo cp insert_dylib /usr/local/bin/ && cd ..
+          echo "=== 安装 Python macholib（用于注入 dylib） ==="
+          pip3 install macholib
           
           echo "=== 工具检查 ==="
           which ldid
-          which insert_dylib
-          xcrun --sdk iphoneos -f clang
+          which python3
+          python3 -c "import macholib; print('macholib 可用')"
           echo "✅ 工具安装完成"
 
       # 第二步：编译 dylib
       - name: 编译 dylib
         run: |
-          make clean
-          make
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          CLANG=$(xcrun --sdk iphoneos -f clang)
+          
+          echo "SDK: $SDK"
+          echo "编译器: $CLANG"
+          
+          $CLANG -arch arm64 -isysroot $SDK -dynamiclib \
+              -o IBOXBypass.dylib \
+              Tweak.m fishhook.c \
+              -fobjc-arc \
+              -framework Foundation \
+              -framework UIKit \
+              -miphoneos-version-min=15.0
+          
+          ldid -S IBOXBypass.dylib
+          ls -lh IBOXBypass.dylib
           file IBOXBypass.dylib
           echo "✅ dylib 编译完成"
 
-      # 第三步：注入到 IPA
+      # 第三步：注入 dylib（用 Python macholib）
       - name: 注入 dylib
         run: |
           # 检查 IPA
@@ -68,12 +80,45 @@ jobs:
           cp IBOXBypass.dylib "$BIN_PATH/"
           echo "✅ dylib 复制完成"
           
-          # 注入加载命令
-          insert_dylib --inplace "@executable_path/IBOXBypass.dylib" "$BIN_PATH/$BIN_NAME"
-          echo "✅ 加载命令注入完成"
+          # 用 Python macholib 注入加载命令
+          python3 << 'EOF'
+          import os
+          from macholib import MachO
           
-          # 验证注入是否成功
-          otool -L "$BIN_PATH/$BIN_NAME" | grep -i bypass
+          bin_path = os.environ.get("BIN_PATH", "temp/Payload/MyRadar.app")
+          bin_name = os.environ.get("BIN_NAME", "MyRadar")
+          full_path = os.path.join(bin_path, bin_name)
+          
+          print(f"正在处理: {full_path}")
+          
+          # 读取 Mach-O
+          m = MachO.MachO(full_path)
+          
+          # 添加加载命令
+          dylib_path = "@executable_path/IBOXBypass.dylib"
+          
+          # 遍历所有架构（通常只有一个 arm64）
+          for header in m.headers:
+              # 添加 LC_LOAD_DYLIB
+              header.addLoadCommand(
+                  MachO.LC_LOAD_DYLIB,
+                  dylib_path,
+                  0,  # timestamp
+                  0,  # current_version
+                  0   # compatibility_version
+              )
+          
+          # 写回文件
+          with open(full_path, 'wb') as f:
+              for header in m.headers:
+                  f.write(header.as_bytes())
+          
+          print("✅ 加载命令注入完成")
+          EOF
+          
+          # 验证注入结果
+          echo "=== 加载命令列表 ==="
+          otool -L "$BIN_PATH/$BIN_NAME" | head -20
           
           # 重新签名
           ldid -S "$BIN_PATH/$BIN_NAME"
