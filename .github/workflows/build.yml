@@ -18,7 +18,7 @@ jobs:
           brew install ldid
           
           echo "=== 安装 Python macholib ==="
-          pip3 install --user macholib
+          pip3 install --break-system-packages macholib
           
           echo "=== 工具检查 ==="
           which ldid
