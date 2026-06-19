@@ -7,13 +7,11 @@ jobs:
     steps:
       - uses: actions/checkout@v3
 
-      # 第一步：安装工具
       - name: 安装工具
         run: |
           brew install ldid
           echo "✅ 工具安装完成"
 
-      # 第二步：Patch 主二进制
       - name: Patch 主二进制
         run: |
           if [ ! -f "original.ipa" ]; then
@@ -27,7 +25,6 @@ jobs:
           APP_NAME=$(ls temp/Payload/ | grep "\.app$" | head -1)
           BIN_PATH="temp/Payload/$APP_NAME"
           
-          # 找主二进制
           BIN_NAME=""
           for f in "$BIN_PATH"/*; do
             if file "$f" | grep -q "Mach-O" && [ ! -d "$f" ]; then
@@ -38,9 +35,6 @@ jobs:
           echo "✅ 主二进制: $BIN_NAME"
           FULL_BIN="$BIN_PATH/$BIN_NAME"
           
-          # ============================================
-          # 完整 Patch 脚本
-          # ============================================
           python3 << 'PYEOF'
           import os
           import struct
@@ -63,31 +57,33 @@ jobs:
           full_path = os.path.join(bin_path, bin_name)
           print(f"处理文件: {full_path}")
           
-          # ========== 读取二进制 ==========
           with open(full_path, 'rb') as f:
               data = bytearray(f.read())
           
-          # ========== 解析 Mach-O 头 ==========
+          # ========== 解析 Mach-O ==========
           magic, cputype, cpusubtype, filetype, ncmds, sizeofcmds, flags, reserved = struct.unpack_from('<IIIIIIII', data, 0)
           
-          # ========== 找段和节 ==========
           text_vmaddr = 0
           text_fileoff = 0
           text_size = 0
           data_vmaddr = 0
           data_fileoff = 0
           objc_classlist_fileoff = 0
-          objc_classlist_size = 0
           symtab_off = 0
           symtab_nsyms = 0
           symtab_stroff = 0
           symtab_strsize = 0
+          stubs_vmaddr = 0
+          stubs_size = 0
+          stubs_reserved1 = 0
+          indirect_symoff = 0
+          indirect_nsyms = 0
           
           offset = 32
           for i in range(ncmds):
               cmd, cmdsize = struct.unpack_from('<II', data, offset)
               
-              if cmd == 0x19:  # LC_SEGMENT_64
+              if cmd == 0x19:
                   segname = data[offset+8:offset+24].rstrip(b'\x00').decode('utf-8', errors='replace')
                   vmaddr, vmsize, fileoff, filesize, maxprot, initprot, nsects, flags = struct.unpack_from('<QQQQIIII', data, offset+24)
                   
@@ -99,22 +95,33 @@ jobs:
                   if segname == '__DATA':
                       data_vmaddr = vmaddr
                       data_fileoff = fileoff
-                      
-                      sect_offset = offset + 72
-                      for j in range(nsects):
-                          sectname = data[sect_offset:sect_offset+16].rstrip(b'\x00').decode('utf-8', errors='replace')
-                          addr, size, offset_sect = struct.unpack_from('<QQI', data, sect_offset+32)
-                          if sectname == '__objc_classlist':
-                              objc_classlist_fileoff = offset_sect
-                              objc_classlist_size = size
-                          sect_offset += 80
+                  
+                  sect_offset = offset + 72
+                  for j in range(nsects):
+                      sectname = data[sect_offset:sect_offset+16].rstrip(b'\x00').decode('utf-8', errors='replace')
+                      addr, size, offset_sect, align, reloff, nreloc, flags, reserved1, reserved2, reserved3 = struct.unpack_from('<QQIIIIIIII', data, sect_offset+32)
+                      if sectname == '__objc_classlist':
+                          objc_classlist_fileoff = offset_sect
+                          objc_classlist_size = size
+                      if sectname == '__stubs':
+                          stubs_vmaddr = addr
+                          stubs_size = size
+                          stubs_reserved1 = reserved1
+                      sect_offset += 80
               
-              elif cmd == 0x2:  # LC_SYMTAB
+              elif cmd == 0x2:
                   symoff, nsyms, stroff, strsize = struct.unpack_from('<IIII', data, offset + 8)
                   symtab_off = symoff
                   symtab_nsyms = nsyms
                   symtab_stroff = stroff
                   symtab_strsize = strsize
+              
+              elif cmd == 0x5:
+                  ilocalsym, nlocalsym, iextdefsym, nextdefsym, iundefsym, nundefsym, \
+                  tocoff, ntoc, modtaboff, nmodtab, extrefsymoff, nextrefsyms, \
+                  indirectsymoff, nindirectsyms, extreloff, nextrel, locreloff, nlocrel = struct.unpack_from('<IIIIIIIIIIIIIIIIII', data, offset + 8)
+                  indirect_symoff = indirectsymoff
+                  indirect_nsyms = nindirectsyms
               
               offset += cmdsize
           
@@ -125,14 +132,11 @@ jobs:
                   return int(vm_addr - data_vmaddr + data_fileoff)
               return None
           
-          print(f"__TEXT: vm={hex(text_vmaddr)} file={hex(text_fileoff)} size={hex(text_size)}")
-          
           # ============================================
-          # 第一步：找 ViewController 的所有方法
+          # 第一步：找 ViewController 的方法
           # ============================================
-          print("\n=== 查找 ViewController 方法 ===")
+          print("\n=== 查找方法 ===")
           
-          # 找 ViewController 类
           num_classes = objc_classlist_size // 8
           viewcontroller_ro = None
           
@@ -147,7 +151,6 @@ jobs:
               if data_file is None:
                   continue
               
-              # 直接读 class_ro_t 的 name
               name_ptr_vm = struct.unpack_from('<Q', data, data_file + 24)[0]
               name_file = vm_to_file(name_ptr_vm)
               if name_file:
@@ -156,20 +159,16 @@ jobs:
                       class_name = data[name_file:name_end].decode('utf-8', errors='replace')
                       if class_name == 'ViewController':
                           viewcontroller_ro = data_ptr_vm
-                          print(f"✅ 找到 ViewController 类")
+                          print(f"✅ 找到 ViewController")
                           break
           
-          # 找方法列表
           ro_file = vm_to_file(viewcontroller_ro)
           base_methods_vm = struct.unpack_from('<Q', data, ro_file + 32)[0]
           base_methods_file = vm_to_file(base_methods_vm)
-          
           entsize, count = struct.unpack_from('<II', data, base_methods_file)
-          print(f"方法数量: {count}")
           
-          # 找关键方法
           methods = {}
-          target_methods = ['onVerify', 'tryAutoLogin:', 'doHeartbeat', 'enterMainConsole']
+          target_methods = ['onVerify', 'tryAutoLogin:', 'doHeartbeat', 'onLoginSuccess']
           
           for i in range(count):
               method_off = base_methods_file + 8 + i * entsize
@@ -185,98 +184,44 @@ jobs:
                       print(f"  ✅ {method_name}: {hex(imp_vm)}")
           
           # ============================================
-          # 第二步：Patch 验证逻辑
+          # 第二步：Patch 验证逻辑（跳转到 onLoginSuccess）
           # ============================================
           print("\n=== Patch 验证逻辑 ===")
           
-          # 1. onVerify → 直接跳转到 enterMainConsole
-          if 'onVerify' in methods and 'enterMainConsole' in methods:
-              onverify_file = vm_to_file(methods['onVerify'])
-              offset_bytes = (methods['enterMainConsole'] - methods['onVerify']) >> 2
-              if offset_bytes < 0:
-                  offset_bytes += (1 << 26)
-              b_instr = 0x14000000 | (offset_bytes & 0x03FFFFFF)
-              struct.pack_into('<I', data, onverify_file, b_instr)
-              print(f"✅ onVerify 已 patch 为跳转到 enterMainConsole (指令: {hex(b_instr)})")
+          def make_b(from_addr, to_addr):
+              diff = to_addr - from_addr
+              imm = diff >> 2
+              if diff < 0:
+                  imm = (diff >> 2) & 0x03FFFFFF
+              return 0x14000000 | (imm & 0x03FFFFFF)
           
-          # 2. tryAutoLogin: → 直接跳转到 enterMainConsole
-          if 'tryAutoLogin:' in methods and 'enterMainConsole' in methods:
-              tryauto_file = vm_to_file(methods['tryAutoLogin:'])
-              offset_bytes = (methods['enterMainConsole'] - methods['tryAutoLogin:']) >> 2
-              if offset_bytes < 0:
-                  offset_bytes += (1 << 26)
-              b_instr = 0x14000000 | (offset_bytes & 0x03FFFFFF)
-              struct.pack_into('<I', data, tryauto_file, b_instr)
-              print(f"✅ tryAutoLogin: 已 patch 为跳转到 enterMainConsole (指令: {hex(b_instr)})")
+          # 1. onVerify → onLoginSuccess
+          if 'onVerify' in methods and 'onLoginSuccess' in methods:
+              addr = vm_to_file(methods['onVerify'])
+              b_instr = make_b(methods['onVerify'], methods['onLoginSuccess'])
+              struct.pack_into('<I', data, addr, b_instr)
+              print(f"✅ onVerify → onLoginSuccess ({hex(b_instr)})")
           
-          # 3. doHeartbeat → 直接返回
+          # 2. tryAutoLogin: → onLoginSuccess
+          if 'tryAutoLogin:' in methods and 'onLoginSuccess' in methods:
+              addr = vm_to_file(methods['tryAutoLogin:'])
+              b_instr = make_b(methods['tryAutoLogin:'], methods['onLoginSuccess'])
+              struct.pack_into('<I', data, addr, b_instr)
+              print(f"✅ tryAutoLogin: → onLoginSuccess ({hex(b_instr)})")
+          
+          # 3. doHeartbeat → ret
           if 'doHeartbeat' in methods:
-              doheartbeat_file = vm_to_file(methods['doHeartbeat'])
-              struct.pack_into('<I', data, doheartbeat_file, 0xD65F03C0)  # ret
-              print(f"✅ doHeartbeat 已 patch 为空实现 (ret)")
+              addr = vm_to_file(methods['doHeartbeat'])
+              struct.pack_into('<I', data, addr, 0xD65F03C0)
+              print(f"✅ doHeartbeat → ret")
           
           # ============================================
-          # 第三步：NOP 所有系统函数调用（防止崩溃）
+          # 第三步：只 NOP 真正的崩溃函数（不碰 sysctl/ptrace）
           # ============================================
-          print("\n=== 查找并 NOP 崩溃相关调用 ===")
+          print("\n=== NOP 崩溃函数 ===")
           
-          # 找 __stubs 段
-          stubs_vmaddr = 0
-          stubs_size = 0
+          crash_names = ['_exit', '_abort', '_kill', '_raise', '_objc_exception_throw', '__assert_rtn', '_pthread_exit']
           
-          offset = 32
-          for i in range(ncmds):
-              cmd, cmdsize = struct.unpack_from('<II', data, offset)
-              if cmd == 0x19:
-                  segname = data[offset+8:offset+24].rstrip(b'\x00').decode('utf-8', errors='replace')
-                  vmaddr, vmsize, fileoff, filesize, maxprot, initprot, nsects, flags = struct.unpack_from('<QQQQIIII', data, offset+24)
-                  if segname == '__TEXT':
-                      sect_offset = offset + 72
-                      for j in range(nsects):
-                          sectname = data[sect_offset:sect_offset+16].rstrip(b'\x00').decode('utf-8', errors='replace')
-                          addr, size, offset_sect = struct.unpack_from('<QQI', data, sect_offset+32)
-                          if sectname == '__stubs' or sectname == '__symbol_stub':
-                              stubs_vmaddr = addr
-                              stubs_size = size
-                              print(f"找到桩代码段 {sectname}: vm={hex(addr)}, size={hex(size)}")
-                          sect_offset += 80
-              offset += cmdsize
-          
-          # 把所有 bl 到 __stubs 段的指令都 NOP 掉（最保险的方法，反正我们不需要任何系统调用崩溃）
-          # 不对，这样会把所有系统调用都 NOP 掉，程序会崩
-          # 还是只 NOP 特定的吧
-          
-          # 换个方法：直接搜索特征函数名找 stub
-          crash_names = ['exit', 'abort', 'kill', 'raise', 'assert', 'exception', 'ptrace', 'sysctl']
-          
-          # 找间接符号表
-          indirect_symoff = 0
-          indirect_nsyms = 0
-          stubs_reserved1 = 0
-          
-          offset = 32
-          for i in range(ncmds):
-              cmd, cmdsize = struct.unpack_from('<II', data, offset)
-              if cmd == 0x5:  # LC_DYSYMTAB
-                  ilocalsym, nlocalsym, iextdefsym, nextdefsym, iundefsym, nundefsym, \
-                  tocoff, ntoc, modtaboff, nmodtab, extrefsymoff, nextrefsyms, \
-                  indirectsymoff, nindirectsyms, extreloff, nextrel, locreloff, nlocrel = struct.unpack_from('<IIIIIIIIIIIIIIIIII', data, offset + 8)
-                  indirect_symoff = indirectsymoff
-                  indirect_nsyms = nindirectsyms
-              if cmd == 0x19:
-                  segname = data[offset+8:offset+24].rstrip(b'\x00').decode('utf-8', errors='replace')
-                  if segname == '__TEXT':
-                      nsects = struct.unpack_from('<I', data, offset + 44)[0]
-                      sect_offset = offset + 72
-                      for j in range(nsects):
-                          sectname = data[sect_offset:sect_offset+16].rstrip(b'\x00').decode('utf-8', errors='replace')
-                          if sectname == '__stubs':
-                              addr, size, offset_sect, align, reloff, nreloc, flags, reserved1, reserved2, reserved3 = struct.unpack_from('<QQIIIIIIII', data, sect_offset+32)
-                              stubs_reserved1 = reserved1
-                          sect_offset += 80
-              offset += cmdsize
-          
-          # 找所有 stub 对应的函数名
           stub_count = stubs_size // 12
           crash_stubs = set()
           
@@ -292,18 +237,16 @@ jobs:
                       if n_strx > 0 and n_strx < symtab_strsize:
                           name_end = data.find(b'\x00', symtab_stroff + n_strx)
                           if name_end > 0:
-                              sym_name = data[symtab_stroff + n_strx:name_end].decode('utf-8', errors='replace').lower()
+                              sym_name = data[symtab_stroff + n_strx:name_end].decode('utf-8', errors='replace')
                               
-                              for crash_name in crash_names:
-                                  if crash_name in sym_name:
-                                      crash_stubs.add(stub_vm)
-                                      break
+                              if sym_name in crash_names:
+                                  crash_stubs.add(stub_vm)
               except:
                   pass
           
-          print(f"找到 {len(crash_stubs)} 个可疑崩溃函数桩")
+          print(f"找到 {len(crash_stubs)} 个崩溃函数桩")
           
-          # NOP 所有调用这些桩的 bl 指令
+          # NOP 调用这些桩的 bl 指令
           nop_count = 0
           pos = text_fileoff
           end = text_fileoff + text_size
@@ -311,7 +254,7 @@ jobs:
           while pos < end - 4:
               instr = struct.unpack_from('<I', data, pos)[0]
               
-              if (instr >> 26) == 0x25:  # bl 指令
+              if (instr >> 26) == 0x25:  # bl
                   imm26 = instr & 0x03FFFFFF
                   if imm26 & 0x02000000:
                       imm26 -= 0x04000000
@@ -326,28 +269,26 @@ jobs:
               
               pos += 4
           
-          print(f"NOP 了 {nop_count} 处崩溃相关调用")
+          print(f"NOP 了 {nop_count} 处崩溃调用")
           
           # ============================================
-          # 写回文件
+          # 写回
           # ============================================
           with open(full_path, 'wb') as f:
               f.write(data)
           
-          print("\n✅ 所有 Patch 完成！")
+          print("\n✅ 全部 Patch 完成！")
           PYEOF
           
-          # 重新签名
           ldid -S "$FULL_BIN"
           echo "✅ 重新签名完成"
           
-          # 重新打包
-          cd temp && zip -qr ../IBOX_已绕过验证_最终版.ipa Payload && cd ..
-          ls -lh IBOX_已绕过验证_最终版.ipa
-          echo "✅ 最终 IPA 打包完成"
+          cd temp && zip -qr ../IBOX_绕过验证_稳定版.ipa Payload && cd ..
+          ls -lh IBOX_绕过验证_稳定版.ipa
+          echo "✅ IPA 打包完成"
 
       - name: 上传最终 IPA
         uses: actions/upload-artifact@v4
         with:
-          name: IBOX_已绕过验证_最终版.ipa
-          path: IBOX_已绕过验证_最终版.ipa
+          name: IBOX_绕过验证_稳定版.ipa
+          path: IBOX_绕过验证_稳定版.ipa
