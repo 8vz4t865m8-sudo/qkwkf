@@ -2,10 +2,13 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <sys/sysctl.h>
-#import <sys/ptrace.h>
 #import <dlfcn.h>
 #import <string.h>
 #import "fishhook.h"
+
+// 自己声明 ptrace（iOS SDK 没这个头文件）
+int ptrace(int request, int pid, void *addr, int data);
+#define PT_DENY_ATTACH 31
 
 #define BYPASS_KEYWORD "bypass"
 
@@ -36,21 +39,17 @@ void my_objc_exception_throw(NSException *e) {
 // ============================================================
 // 2. 反调试 Hook
 // ============================================================
-static int (*orig_ptrace)(int, pid_t, caddr_t, int);
+static int (*orig_ptrace)(int, int, void *, int);
 static int (*orig_sysctl)(int *, u_int, void *, size_t *, void *, size_t);
 static int (*orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t);
 
-int my_ptrace(int req, pid_t pid, caddr_t addr, int data) {
+int my_ptrace(int req, int pid, void *addr, int data) {
     NSLog(@"[Bypass] 拦截 ptrace: %d", req);
     return 0;
 }
 
 int my_sysctl(int *name, u_int namelen, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
     int ret = orig_sysctl(name, namelen, oldp, oldlenp, newp, newlen);
-    if (oldp && namelen == 4 && name[0] == CTL_KERN && name[1] == KERN_PROC && name[2] == KERN_PROC_PID) {
-        struct kinfo_proc *proc = (struct kinfo_proc *)oldp;
-        proc->kp_proc.p_flag &= ~P_TRACED;
-    }
     return ret;
 }
 
@@ -105,8 +104,8 @@ static void (*orig_doHeartbeat)(id, SEL);
 
 void my_buildAuthView(id self, SEL _cmd) {
     NSLog(@"[Bypass] Hook buildAuthView，直接进主界面");
-    SEL buildSel = @selector(buildMainView);
-    SEL enterSel = @selector(enterMainConsole);
+    SEL buildSel = NSSelectorFromString(@"buildMainView");
+    SEL enterSel = NSSelectorFromString(@"enterMainConsole");
     if ([self respondsToSelector:buildSel]) {
         IMP imp = [self methodForSelector:buildSel];
         ((void (*)(id, SEL))imp)(self, buildSel);
@@ -119,7 +118,7 @@ void my_buildAuthView(id self, SEL _cmd) {
 
 void my_onVerify(id self, SEL _cmd) {
     NSLog(@"[Bypass] Hook onVerify，直接进主界面");
-    SEL enterSel = @selector(enterMainConsole);
+    SEL enterSel = NSSelectorFromString(@"enterMainConsole");
     if ([self respondsToSelector:enterSel]) {
         IMP imp = [self methodForSelector:enterSel];
         ((void (*)(id, SEL))imp)(self, enterSel);
@@ -128,7 +127,7 @@ void my_onVerify(id self, SEL _cmd) {
 
 void my_tryAutoLogin(id self, SEL _cmd, id sender) {
     NSLog(@"[Bypass] Hook tryAutoLogin，直接进主界面");
-    SEL enterSel = @selector(enterMainConsole);
+    SEL enterSel = NSSelectorFromString(@"enterMainConsole");
     if ([self respondsToSelector:enterSel]) {
         IMP imp = [self methodForSelector:enterSel];
         ((void (*)(id, SEL))imp)(self, enterSel);
@@ -151,16 +150,16 @@ static void hook_oc_methods(void) {
     
     Method m;
     
-    m = class_getInstanceMethod(cls, @selector(buildAuthView));
+    m = class_getInstanceMethod(cls, NSSelectorFromString(@"buildAuthView"));
     if (m) { orig_buildAuthView = (void *)method_getImplementation(m); method_setImplementation(m, (IMP)my_buildAuthView); }
     
-    m = class_getInstanceMethod(cls, @selector(onVerify));
+    m = class_getInstanceMethod(cls, NSSelectorFromString(@"onVerify"));
     if (m) { orig_onVerify = (void *)method_getImplementation(m); method_setImplementation(m, (IMP)my_onVerify); }
     
-    m = class_getInstanceMethod(cls, @selector(tryAutoLogin:));
+    m = class_getInstanceMethod(cls, NSSelectorFromString(@"tryAutoLogin:"));
     if (m) { orig_tryAutoLogin = (void *)method_getImplementation(m); method_setImplementation(m, (IMP)my_tryAutoLogin); }
     
-    m = class_getInstanceMethod(cls, @selector(doHeartbeat));
+    m = class_getInstanceMethod(cls, NSSelectorFromString(@"doHeartbeat"));
     if (m) { orig_doHeartbeat = (void *)method_getImplementation(m); method_setImplementation(m, (IMP)my_doHeartbeat); }
     
     NSLog(@"[Bypass] OC 方法 Hook 完成");
