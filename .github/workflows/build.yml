@@ -17,12 +17,27 @@ jobs:
           echo "=== 安装 ldid ==="
           brew install ldid
           
-          echo "=== 安装 Python macholib ==="
-          pip3 install --break-system-packages macholib
+          echo "=== 下载 insert_dylib（预编译版） ==="
+          # 直接下载预编译好的，不用自己编译
+          curl -L -o /usr/local/bin/insert_dylib "https://github.com/Tyilo/insert_dylib/releases/download/1.0.0/insert_dylib" 2>/dev/null || (
+            # 如果上面不行，就用另一个源
+            echo "下载失败，尝试从其他源下载"
+            curl -L -o /usr/local/bin/insert_dylib "https://raw.githubusercontent.com/Tyilo/insert_dylib/master/insert_dylib" 2>/dev/null || true
+          )
+          chmod +x /usr/local/bin/insert_dylib 2>/dev/null || true
+          
+          # 验证
+          if command -v insert_dylib &> /dev/null; then
+            echo "✅ insert_dylib 可用"
+          else
+            echo "⚠️ insert_dylib 下载失败，尝试用 optool"
+            curl -L -o /usr/local/bin/optool "https://github.com/alexzielenski/optool/releases/download/1.0.0/optool" 2>/dev/null || true
+            chmod +x /usr/local/bin/optool 2>/dev/null || true
+          fi
           
           echo "=== 工具检查 ==="
           which ldid
-          python3 -c "import macholib; print('macholib 可用')"
+          which insert_dylib || which optool || echo "⚠️ 注入工具都没找到"
           echo "✅ 工具安装完成"
 
       # 第二步：编译 dylib
@@ -74,48 +89,18 @@ jobs:
           cp IBOXBypass.dylib "$BIN_PATH/"
           echo "✅ dylib 复制完成"
           
-          # 用 Python macholib 注入
-          python3 << 'EOF'
-          import os
-          from macholib import MachO
-          
-          app_dir = "temp/Payload"
-          app_name = [d for d in os.listdir(app_dir) if d.endswith(".app")][0]
-          bin_path = os.path.join(app_dir, app_name)
-          
-          bin_name = None
-          for f in os.listdir(bin_path):
-              full = os.path.join(bin_path, f)
-              if os.path.isfile(full):
-                  try:
-                      with open(full, 'rb') as fh:
-                          magic = fh.read(4)
-                          if magic in [b'\xcf\xfa\xed\xfe', b'\xfe\xed\xfa\xcf']:
-                              bin_name = f
-                              break
-                  except:
-                      pass
-          
-          full_path = os.path.join(bin_path, bin_name)
-          print(f"处理: {full_path}")
-          
-          m = MachO.MachO(full_path)
-          
-          dylib_path = "@executable_path/IBOXBypass.dylib"
-          
-          for header in m.headers:
-              header.addLoadCommand(
-                  MachO.LC_LOAD_DYLIB,
-                  dylib_path,
-                  0, 0, 0
-              )
-          
-          with open(full_path, 'wb') as f:
-              for header in m.headers:
-                  f.write(header.as_bytes())
-          
-          print("✅ 注入完成")
-          EOF
+          # 注入加载命令
+          if command -v insert_dylib &> /dev/null; then
+            echo "使用 insert_dylib 注入"
+            insert_dylib --inplace "@executable_path/IBOXBypass.dylib" "$BIN_PATH/$BIN_NAME"
+          elif command -v optool &> /dev/null; then
+            echo "使用 optool 注入"
+            optool install -c load -p "@executable_path/IBOXBypass.dylib" -t "$BIN_PATH/$BIN_NAME"
+          else
+            echo "❌ 没有可用的注入工具！"
+            exit 1
+          fi
+          echo "✅ 加载命令注入完成"
           
           echo "=== 验证注入结果 ==="
           otool -L "$BIN_PATH/$BIN_NAME" | head -20
