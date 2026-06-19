@@ -50,7 +50,7 @@ jobs:
           unzip -q original.ipa -d temp
           echo "✅ IPA 解压完成"
           
-          # 找 APP 名字（自动识别，不用硬编码）
+          # 找 APP 名字（自动识别）
           APP_NAME=$(ls temp/Payload/ | grep ".app" | head -1)
           echo "✅ 找到 APP: $APP_NAME"
           
@@ -76,15 +76,15 @@ jobs:
           ls -lh IBOX_已绕过验证.ipa
           echo "✅ 最终 IPA 打包完成"
 
-      # 第五步：上传产物
+      # 第五步：上传产物（改成 v4）
       - name: 上传最终 IPA
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: IBOX_已绕过验证.ipa
           path: IBOX_已绕过验证.ipa
 
-      - name: 上传 dylib
-        uses: actions/upload-artifact@v3
+      - name: 上传 dylib（改成 v4）
+        uses: actions/upload-artifact@v4
         with:
           name: IBOXBypass.dylib
           path: .theos/obj/debug/IBOXBypass.dylib
