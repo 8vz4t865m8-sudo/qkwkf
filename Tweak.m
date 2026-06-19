@@ -5,19 +5,19 @@
 #import <dlfcn.h>
 #import <string.h>
 #import "fishhook.h"
+#import <CommonCrypto/CommonDigest.h>
 
 // 自己声明缺失的函数
 int ptrace(int request, int pid, void *addr, int data);
 #define PT_DENY_ATTACH 31
 
-// dyld 函数声明
 uint32_t _dyld_image_count(void);
 const char* _dyld_get_image_name(uint32_t image_index);
 
 #define BYPASS_KEYWORD "bypass"
 
 // ============================================================
-// 1. 崩溃函数 Hook
+// 1. 崩溃函数 Hook（防止自杀）
 // ============================================================
 static void (*orig_abort)(void);
 static void (*orig_exit)(int);
@@ -69,7 +69,39 @@ int my_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, s
 }
 
 // ============================================================
-// 3. 注入检测 Hook（隐藏自己）
+// 3. 哈希校验 Hook（关键！防止完整性校验闪退）
+// ============================================================
+static unsigned char *(*orig_CC_MD5)(const void *data, CC_LONG len, unsigned char *md);
+static unsigned char *(*orig_CC_SHA1)(const void *data, CC_LONG len, unsigned char *md);
+static unsigned char *(*orig_CC_SHA256)(const void *data, CC_LONG len, unsigned char *md);
+
+// 固定的假哈希值（全0）
+unsigned char *my_CC_MD5(const void *data, CC_LONG len, unsigned char *md) {
+    NSLog(@"[Bypass] 拦截 CC_MD5，len=%lu", (unsigned long)len);
+    if (md) {
+        memset(md, 0, CC_MD5_DIGEST_LENGTH);
+    }
+    return md;
+}
+
+unsigned char *my_CC_SHA1(const void *data, CC_LONG len, unsigned char *md) {
+    NSLog(@"[Bypass] 拦截 CC_SHA1，len=%lu", (unsigned long)len);
+    if (md) {
+        memset(md, 0, CC_SHA1_DIGEST_LENGTH);
+    }
+    return md;
+}
+
+unsigned char *my_CC_SHA256(const void *data, CC_LONG len, unsigned char *md) {
+    NSLog(@"[Bypass] 拦截 CC_SHA256，len=%lu", (unsigned long)len);
+    if (md) {
+        memset(md, 0, CC_SHA256_DIGEST_LENGTH);
+    }
+    return md;
+}
+
+// ============================================================
+// 4. 注入检测 Hook（隐藏自己）
 // ============================================================
 static uint32_t (*orig_dyld_image_count)(void);
 static const char *(*orig_dyld_get_image_name)(uint32_t);
@@ -99,7 +131,7 @@ const char *my_dyld_get_image_name(uint32_t index) {
 }
 
 // ============================================================
-// 4. 验证方法 Hook
+// 5. 验证方法 Hook（核心）
 // ============================================================
 static void (*orig_buildAuthView)(id, SEL);
 static void (*orig_onVerify)(id, SEL);
@@ -143,7 +175,7 @@ void my_doHeartbeat(id self, SEL _cmd) {
 }
 
 // ============================================================
-// 5. 等 APP 启动完再 Hook OC
+// 6. 等 APP 启动完再 Hook OC
 // ============================================================
 static void hook_oc_methods(void) {
     Class cls = objc_getClass("ViewController");
@@ -175,27 +207,36 @@ static void app_did_finish(NSNotification *note) {
 }
 
 // ============================================================
-// 6. 构造函数
+// 7. 构造函数（最早执行）
 // ============================================================
 __attribute__((constructor)) static void init() {
     NSLog(@"[Bypass] ===== dylib 加载成功 =====");
     
     find_bypass_index();
     
+    // 所有 C 函数 Hook（越早越好）
     struct rebinding rebs[] = {
+        // 崩溃
         {"abort", my_abort, (void *)&orig_abort},
         {"exit", my_exit, (void *)&orig_exit},
         {"kill", my_kill, (void *)&orig_kill},
         {"objc_exception_throw", my_objc_exception_throw, (void *)&orig_objc_exception_throw},
+        // 反调试
         {"ptrace", my_ptrace, (void *)&orig_ptrace},
         {"sysctl", my_sysctl, (void *)&orig_sysctl},
         {"sysctlbyname", my_sysctlbyname, (void *)&orig_sysctlbyname},
+        // 哈希校验（关键！）
+        {"CC_MD5", my_CC_MD5, (void *)&orig_CC_MD5},
+        {"CC_SHA1", my_CC_SHA1, (void *)&orig_CC_SHA1},
+        {"CC_SHA256", my_CC_SHA256, (void *)&orig_CC_SHA256},
+        // 注入检测
         {"_dyld_image_count", my_dyld_image_count, (void *)&orig_dyld_image_count},
         {"_dyld_get_image_name", my_dyld_get_image_name, (void *)&orig_dyld_get_image_name},
     };
     rebind_symbols(rebs, sizeof(rebs)/sizeof(rebs[0]));
     NSLog(@"[Bypass] C 函数 Hook 完成");
     
+    // 等 APP 启动完再 Hook OC 方法
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification
                                                       object:nil
                                                        queue:[NSOperationQueue mainQueue]
