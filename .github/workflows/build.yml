@@ -14,16 +14,17 @@ jobs:
           echo "THEOS=${{ github.workspace }}/theos" >> $GITHUB_ENV
           echo "✅ Theos 安装完成"
 
-      # 第二步：安装 optool 和 ldid
+      # 第二步：安装工具（用 brew，自动解决依赖）
       - name: 安装注入工具
         run: |
-          # 安装 optool
-          git clone https://github.com/alexzielenski/optool.git
-          cd optool && make && sudo cp optool /usr/local/bin/ && cd ..
+          # 安装 ldid（用 brew，自动解决依赖）
+          brew install ldid
           
-          # 安装 ldid
-          git clone https://github.com/ProcursusTeam/ldid.git
-          cd ldid && make && sudo cp ldid /usr/local/bin/ && cd ..
+          # 安装 optool（优先 brew，失败再自己编译）
+          brew install opa334/optool/optool 2>/dev/null || (
+            git clone https://github.com/alexzielenski/optool.git
+            cd optool && make && sudo cp optool /usr/local/bin/ && cd ..
+          )
           
           echo "✅ 工具安装完成"
           which optool
@@ -40,7 +41,7 @@ jobs:
       # 第四步：注入到 IPA
       - name: 注入 dylib
         run: |
-          # 检查原始 IPA 是否存在
+          # 检查原始 IPA
           if [ ! -f "original.ipa" ]; then
             echo "❌ 错误：仓库根目录找不到 original.ipa 文件！"
             exit 1
@@ -50,12 +51,12 @@ jobs:
           unzip -q original.ipa -d temp
           echo "✅ IPA 解压完成"
           
-          # 找 APP 名字（自动识别）
+          # 找 APP 名字
           APP_NAME=$(ls temp/Payload/ | grep ".app" | head -1)
           echo "✅ 找到 APP: $APP_NAME"
           
-          # 找主二进制名字（自动识别）
-          BIN_NAME=$(ls "temp/Payload/$APP_NAME/" | grep -v ".dylib" | grep -v ".nib" | grep -v ".plist" | grep -v ".png" | grep -v ".lproj" | grep -v "_CodeSignature" | head -1)
+          # 找主二进制（自动识别）
+          BIN_NAME=$(ls "temp/Payload/$APP_NAME/" | grep -v ".dylib" | grep -v ".nib" | grep -v ".plist" | grep -v ".png" | grep -v ".lproj" | grep -v "_CodeSignature" | grep -v "Assets" | head -1)
           echo "✅ 主二进制: $BIN_NAME"
           
           # 复制 dylib
@@ -76,14 +77,14 @@ jobs:
           ls -lh IBOX_已绕过验证.ipa
           echo "✅ 最终 IPA 打包完成"
 
-      # 第五步：上传产物（改成 v4）
+      # 第五步：上传产物
       - name: 上传最终 IPA
         uses: actions/upload-artifact@v4
         with:
           name: IBOX_已绕过验证.ipa
           path: IBOX_已绕过验证.ipa
 
-      - name: 上传 dylib（改成 v4）
+      - name: 上传 dylib
         uses: actions/upload-artifact@v4
         with:
           name: IBOXBypass.dylib
