@@ -17,27 +17,9 @@ jobs:
           echo "=== 安装 ldid ==="
           brew install ldid
           
-          echo "=== 下载 insert_dylib（预编译版） ==="
-          # 直接下载预编译好的，不用自己编译
-          curl -L -o /usr/local/bin/insert_dylib "https://github.com/Tyilo/insert_dylib/releases/download/1.0.0/insert_dylib" 2>/dev/null || (
-            # 如果上面不行，就用另一个源
-            echo "下载失败，尝试从其他源下载"
-            curl -L -o /usr/local/bin/insert_dylib "https://raw.githubusercontent.com/Tyilo/insert_dylib/master/insert_dylib" 2>/dev/null || true
-          )
-          chmod +x /usr/local/bin/insert_dylib 2>/dev/null || true
-          
-          # 验证
-          if command -v insert_dylib &> /dev/null; then
-            echo "✅ insert_dylib 可用"
-          else
-            echo "⚠️ insert_dylib 下载失败，尝试用 optool"
-            curl -L -o /usr/local/bin/optool "https://github.com/alexzielenski/optool/releases/download/1.0.0/optool" 2>/dev/null || true
-            chmod +x /usr/local/bin/optool 2>/dev/null || true
-          fi
-          
           echo "=== 工具检查 ==="
           which ldid
-          which insert_dylib || which optool || echo "⚠️ 注入工具都没找到"
+          which python3
           echo "✅ 工具安装完成"
 
       # 第二步：编译 dylib
@@ -62,7 +44,7 @@ jobs:
           file IBOXBypass.dylib
           echo "✅ dylib 编译完成"
 
-      # 第三步：注入 dylib
+      # 第三步：注入 dylib（纯 Python 手动写 Mach-O）
       - name: 注入 dylib
         run: |
           if [ ! -f "original.ipa" ]; then
@@ -89,18 +71,84 @@ jobs:
           cp IBOXBypass.dylib "$BIN_PATH/"
           echo "✅ dylib 复制完成"
           
-          # 注入加载命令
-          if command -v insert_dylib &> /dev/null; then
-            echo "使用 insert_dylib 注入"
-            insert_dylib --inplace "@executable_path/IBOXBypass.dylib" "$BIN_PATH/$BIN_NAME"
-          elif command -v optool &> /dev/null; then
-            echo "使用 optool 注入"
-            optool install -c load -p "@executable_path/IBOXBypass.dylib" -t "$BIN_PATH/$BIN_NAME"
-          else
-            echo "❌ 没有可用的注入工具！"
-            exit 1
-          fi
-          echo "✅ 加载命令注入完成"
+          # 纯 Python 手动注入 LC_LOAD_DYLIB
+          python3 << 'EOF'
+          import os
+          import struct
+          
+          # 找主二进制
+          app_dir = "temp/Payload"
+          app_name = [d for d in os.listdir(app_dir) if d.endswith(".app")][0]
+          bin_path = os.path.join(app_dir, app_name)
+          
+          bin_name = None
+          for f in os.listdir(bin_path):
+              full = os.path.join(bin_path, f)
+              if os.path.isfile(full):
+                  with open(full, 'rb') as fh:
+                      magic = fh.read(4)
+                      if magic == b'\xcf\xfa\xed\xfe':  # ARM64 little endian
+                          bin_name = f
+                          break
+          
+          full_path = os.path.join(bin_path, bin_name)
+          print(f"处理: {full_path}")
+          
+          # 读取文件
+          with open(full_path, 'rb') as f:
+              data = bytearray(f.read())
+          
+          # 解析 Mach-O 头 (32 bytes for 64-bit)
+          magic, cputype, cpusubtype, filetype, ncmds, sizeofcmds, flags, reserved = struct.unpack_from('<IIIIIIII', data, 0)
+          
+          print(f"Magic: {hex(magic)}")
+          print(f"CPU: {cputype}")
+          print(f"加载命令数量: {ncmds}")
+          print(f"加载命令总大小: {sizeofcmds}")
+          
+          # 要添加的 dylib 路径
+          dylib_path = "@executable_path/IBOXBypass.dylib"
+          path_bytes = dylib_path.encode('utf-8') + b'\x00'
+          
+          # LC_LOAD_DYLIB 命令结构
+          # cmd (4) + cmdsize (4) + offset (4) + timestamp (4) + current_version (4) + compatibility_version (4) + path
+          path_offset = 24  # 从命令开始到路径字符串的偏移
+          cmdsize = path_offset + len(path_bytes)
+          # 对齐到 8 字节
+          if cmdsize % 8 != 0:
+              cmdsize += 8 - (cmdsize % 8)
+              path_bytes = path_bytes + b'\x00' * (cmdsize - path_offset - len(path_bytes))
+          
+          # 构造加载命令
+          LC_LOAD_DYLIB = 0xC
+          cmd_data = struct.pack('<IIIIII', 
+              LC_LOAD_DYLIB,  # cmd
+              cmdsize,        # cmdsize
+              path_offset,    # offset (到路径的偏移)
+              0,              # timestamp
+              0x00010000,     # current_version (1.0.0)
+              0x00010000      # compatibility_version (1.0.0)
+          ) + path_bytes
+          
+          print(f"新命令大小: {cmdsize}")
+          
+          # 找到加载命令的结束位置（在第 28 字节之后 sizeofcmds 字节）
+          cmds_start = 32  # 64-bit header is 32 bytes
+          cmds_end = cmds_start + sizeofcmds
+          
+          # 在加载命令末尾插入新命令
+          new_data = data[:cmds_end] + cmd_data + data[cmds_end:]
+          
+          # 更新头里的 ncmds 和 sizeofcmds
+          struct.pack_into('<I', new_data, 16, ncmds + 1)      # ncmds
+          struct.pack_into('<I', new_data, 20, sizeofcmds + cmdsize)  # sizeofcmds
+          
+          # 写回文件
+          with open(full_path, 'wb') as f:
+              f.write(new_data)
+          
+          print("✅ 加载命令注入完成")
+          EOF
           
           echo "=== 验证注入结果 ==="
           otool -L "$BIN_PATH/$BIN_NAME" | head -20
