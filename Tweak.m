@@ -6,9 +6,13 @@
 #import <string.h>
 #import "fishhook.h"
 
-// 自己声明 ptrace（iOS SDK 没这个头文件）
+// 自己声明缺失的函数
 int ptrace(int request, int pid, void *addr, int data);
 #define PT_DENY_ATTACH 31
+
+// dyld 函数声明
+uint32_t _dyld_image_count(void);
+const char* _dyld_get_image_name(uint32_t image_index);
 
 #define BYPASS_KEYWORD "bypass"
 
