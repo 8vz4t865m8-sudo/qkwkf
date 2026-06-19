@@ -17,12 +17,11 @@ jobs:
           echo "=== 安装 ldid ==="
           brew install ldid
           
-          echo "=== 安装 Python macholib（用于注入 dylib） ==="
-          pip3 install macholib
+          echo "=== 安装 Python macholib ==="
+          pip3 install --user macholib
           
           echo "=== 工具检查 ==="
           which ldid
-          which python3
           python3 -c "import macholib; print('macholib 可用')"
           echo "✅ 工具安装完成"
 
@@ -48,24 +47,20 @@ jobs:
           file IBOXBypass.dylib
           echo "✅ dylib 编译完成"
 
-      # 第三步：注入 dylib（用 Python macholib）
+      # 第三步：注入 dylib
       - name: 注入 dylib
         run: |
-          # 检查 IPA
           if [ ! -f "original.ipa" ]; then
             echo "❌ 错误：仓库根目录找不到 original.ipa！"
             exit 1
           fi
           
-          # 解压
           unzip -q original.ipa -d temp
           echo "✅ IPA 解压完成"
           
-          # 找 APP
           APP_NAME=$(ls temp/Payload/ | grep "\.app$" | head -1)
           echo "✅ APP: $APP_NAME"
           
-          # 找主二进制（Mach-O 文件）
           BIN_PATH="temp/Payload/$APP_NAME"
           BIN_NAME=""
           for f in "$BIN_PATH"/*; do
@@ -76,61 +71,63 @@ jobs:
           done
           echo "✅ 主二进制: $BIN_NAME"
           
-          # 复制 dylib
           cp IBOXBypass.dylib "$BIN_PATH/"
           echo "✅ dylib 复制完成"
           
-          # 用 Python macholib 注入加载命令
+          # 用 Python macholib 注入
           python3 << 'EOF'
           import os
           from macholib import MachO
           
-          bin_path = os.environ.get("BIN_PATH", "temp/Payload/MyRadar.app")
-          bin_name = os.environ.get("BIN_NAME", "MyRadar")
+          app_dir = "temp/Payload"
+          app_name = [d for d in os.listdir(app_dir) if d.endswith(".app")][0]
+          bin_path = os.path.join(app_dir, app_name)
+          
+          bin_name = None
+          for f in os.listdir(bin_path):
+              full = os.path.join(bin_path, f)
+              if os.path.isfile(full):
+                  try:
+                      with open(full, 'rb') as fh:
+                          magic = fh.read(4)
+                          if magic in [b'\xcf\xfa\xed\xfe', b'\xfe\xed\xfa\xcf']:
+                              bin_name = f
+                              break
+                  except:
+                      pass
+          
           full_path = os.path.join(bin_path, bin_name)
+          print(f"处理: {full_path}")
           
-          print(f"正在处理: {full_path}")
-          
-          # 读取 Mach-O
           m = MachO.MachO(full_path)
           
-          # 添加加载命令
           dylib_path = "@executable_path/IBOXBypass.dylib"
           
-          # 遍历所有架构（通常只有一个 arm64）
           for header in m.headers:
-              # 添加 LC_LOAD_DYLIB
               header.addLoadCommand(
                   MachO.LC_LOAD_DYLIB,
                   dylib_path,
-                  0,  # timestamp
-                  0,  # current_version
-                  0   # compatibility_version
+                  0, 0, 0
               )
           
-          # 写回文件
           with open(full_path, 'wb') as f:
               for header in m.headers:
                   f.write(header.as_bytes())
           
-          print("✅ 加载命令注入完成")
+          print("✅ 注入完成")
           EOF
           
-          # 验证注入结果
-          echo "=== 加载命令列表 ==="
+          echo "=== 验证注入结果 ==="
           otool -L "$BIN_PATH/$BIN_NAME" | head -20
           
-          # 重新签名
           ldid -S "$BIN_PATH/$BIN_NAME"
           ldid -S "$BIN_PATH/IBOXBypass.dylib"
           echo "✅ 重新签名完成"
           
-          # 重新打包
           cd temp && zip -qr ../IBOX_已绕过验证.ipa Payload && cd ..
           ls -lh IBOX_已绕过验证.ipa
           echo "✅ 最终 IPA 打包完成"
 
-      # 第四步：上传
       - name: 上传最终 IPA
         uses: actions/upload-artifact@v4
         with:
