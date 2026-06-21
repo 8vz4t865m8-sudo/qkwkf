@@ -60,12 +60,13 @@ static void swizzleClassMethod(Class class, SEL originalSelector, SEL swizzledSe
         return;
     }
     
-    class_addMethod(object_getClass(class),
+    Class metaClass = object_getClass(class);
+    class_addMethod(metaClass,
                    originalSelector,
                    method_getImplementation(swizzledMethod),
                    method_getTypeEncoding(swizzledMethod));
     
-    class_addMethod(object_getClass(class),
+    class_addMethod(metaClass,
                    swizzledSelector,
                    method_getImplementation(originalMethod),
                    method_getTypeEncoding(originalMethod));
@@ -75,12 +76,12 @@ static void swizzleClassMethod(Class class, SEL originalSelector, SEL swizzledSe
     method_exchangeImplementations(origMethod, swizMethod);
 }
 
-#pragma mark - NSString Swizzle
+#pragma mark - NSString Swizzle (类方法)
 
 @interface NSString (IPHook)
 + (instancetype)iphook_stringWithUTF8String:(const char *)nullTerminatedCString;
 + (instancetype)iphook_URLWithString:(NSString *)URLString;
-- (instancetype)iphook_initWithUTF8String:(const char *)nullTerminatedCString;
++ (instancetype)iphook_stringWithFormat:(NSString *)format, ...;
 @end
 
 @implementation NSString (IPHook)
@@ -94,9 +95,12 @@ static void swizzleClassMethod(Class class, SEL originalSelector, SEL swizzledSe
     return [self iphook_URLWithString:replaceIP(URLString)];
 }
 
-- (instancetype)iphook_initWithUTF8String:(const char *)nullTerminatedCString {
-    self = [self iphook_initWithUTF8String:nullTerminatedCString];
-    return replaceIP(self);
++ (instancetype)iphook_stringWithFormat:(NSString *)format, ... {
+    va_list args;
+    va_start(args, format);
+    NSString *result = [[NSString alloc] initWithFormat:format arguments:args];
+    va_end(args);
+    return replaceIP(result);
 }
 
 @end
@@ -170,10 +174,9 @@ static void iphook_initialize() {
                           @selector(URLWithString:), 
                           @selector(iphook_URLWithString:));
         
-        // NSString 实例方法
-        swizzleMethod([NSString class], 
-                     @selector(initWithUTF8String:), 
-                     @selector(iphook_initWithUTF8String:));
+        swizzleClassMethod([NSString class], 
+                          @selector(stringWithFormat:), 
+                          @selector(iphook_stringWithFormat:));
         
         // UILabel
         swizzleMethod([UILabel class], 
@@ -188,10 +191,15 @@ static void iphook_initialize() {
         // RadarRelayClient
         Class radarClass = objc_getClass("RadarRelayClient");
         if (radarClass) {
-            swizzleMethod(radarClass, 
-                         @selector(initWithServerURL:room:), 
-                         @selector(iphook_initWithServerURL:room:));
-            NSLog(@"[IPHook] RadarRelayClient hook成功");
+            // 用另一种方式swizzle init方法
+            Method original = class_getInstanceMethod(radarClass, @selector(initWithServerURL:room:));
+            Method swizzled = class_getInstanceMethod(radarClass, @selector(iphook_initWithServerURL:room:));
+            if (original && swizzled) {
+                method_exchangeImplementations(original, swizzled);
+                NSLog(@"[IPHook] RadarRelayClient hook成功");
+            } else {
+                NSLog(@"[IPHook] RadarRelayClient 方法不存在");
+            }
         } else {
             NSLog(@"[IPHook] 警告: 找不到 RadarRelayClient 类");
         }
