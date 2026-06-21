@@ -133,27 +133,6 @@ static void swizzleClassMethod(Class class, SEL originalSelector, SEL swizzledSe
 
 @end
 
-#pragma mark - RadarRelayClient Swizzle
-
-@interface RadarRelayClient : NSObject
-- (instancetype)initWithServerURL:(NSString *)url room:(NSString *)room;
-@end
-
-@interface RadarRelayClient (IPHook)
-- (instancetype)iphook_initWithServerURL:(NSString *)url room:(NSString *)room;
-@end
-
-@implementation RadarRelayClient (IPHook)
-
-- (instancetype)iphook_initWithServerURL:(NSString *)url room:(NSString *)room {
-    NSLog(@"[IPHook] RadarRelayClient 原始: %@", url);
-    NSString *newUrl = replaceIP(url);
-    NSLog(@"[IPHook] RadarRelayClient 替换: %@", newUrl);
-    return [self iphook_initWithServerURL:newUrl room:room];
-}
-
-@end
-
 #pragma mark - 初始化
 
 __attribute__((constructor))
@@ -188,17 +167,41 @@ static void iphook_initialize() {
                      @selector(setString:), 
                      @selector(iphook_setString:));
         
-        // RadarRelayClient
+        // RadarRelayClient (动态获取类，动态添加方法)
         Class radarClass = objc_getClass("RadarRelayClient");
         if (radarClass) {
-            // 用另一种方式swizzle init方法
-            Method original = class_getInstanceMethod(radarClass, @selector(initWithServerURL:room:));
-            Method swizzled = class_getInstanceMethod(radarClass, @selector(iphook_initWithServerURL:room:));
-            if (original && swizzled) {
-                method_exchangeImplementations(original, swizzled);
-                NSLog(@"[IPHook] RadarRelayClient hook成功");
+            NSLog(@"[IPHook] 找到 RadarRelayClient 类");
+            
+            SEL originalSel = @selector(initWithServerURL:room:);
+            SEL swizzledSel = @selector(iphook_initWithServerURL:room:);
+            
+            // 原方法
+            Method originalMethod = class_getInstanceMethod(radarClass, originalSel);
+            if (!originalMethod) {
+                NSLog(@"[IPHook] 警告: 找不到 initWithServerURL:room: 方法");
             } else {
-                NSLog(@"[IPHook] RadarRelayClient 方法不存在");
+                // 用block创建替换方法
+                IMP originalImp = method_getImplementation(originalMethod);
+                id (*originalFunc)(id, SEL, NSString *, NSString *) = (void *)originalImp;
+                
+                IMP swizzledImp = imp_implementationWithBlock(^id(id self, NSString *url, NSString *room) {
+                    NSLog(@"[IPHook] RadarRelayClient 原始: %@", url);
+                    NSString *newUrl = replaceIP(url);
+                    NSLog(@"[IPHook] RadarRelayClient 替换: %@", newUrl);
+                    return originalFunc(self, originalSel, newUrl, room);
+                });
+                
+                // 添加替换方法
+                class_addMethod(radarClass,
+                               swizzledSel,
+                               swizzledImp,
+                               method_getTypeEncoding(originalMethod));
+                
+                // 交换方法
+                Method swizzledMethod = class_getInstanceMethod(radarClass, swizzledSel);
+                method_exchangeImplementations(originalMethod, swizzledMethod);
+                
+                NSLog(@"[IPHook] RadarRelayClient hook成功");
             }
         } else {
             NSLog(@"[IPHook] 警告: 找不到 RadarRelayClient 类");
