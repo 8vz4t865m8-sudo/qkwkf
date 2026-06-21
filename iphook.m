@@ -1,10 +1,10 @@
 #import <Foundation/Foundation.h>
-#import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 
-// ====== 配置区域 - 改成你自己的服务器地址 ======
+// ====== 配置区域 - 改成你自己的服务器 ======
 static NSString * const kOldServerIP = @"45.207.210.194";
 static NSString * const kNewServerIP = @"123.123.123.123";
+static int const kPort = 8080;
 // ============================================
 
 #pragma mark - 辅助函数
@@ -20,78 +20,20 @@ static NSString *replaceIP(NSString *str) {
     return str;
 }
 
-#pragma mark - Method Swizzling 辅助函数
-
-static void swizzleMethod(Class class, SEL originalSelector, SEL swizzledSelector) {
-    Method originalMethod = class_getInstanceMethod(class, originalSelector);
-    Method swizzledMethod = class_getInstanceMethod(class, swizzledSelector);
-    
-    if (!originalMethod || !swizzledMethod) {
-        NSLog(@"[IPHook] 方法不存在: %@ 或 %@", 
-              NSStringFromSelector(originalSelector), 
-              NSStringFromSelector(swizzledSelector));
-        return;
-    }
-    
-    method_exchangeImplementations(originalMethod, swizzledMethod);
-}
-
-#pragma mark - UILabel Swizzle
-
-@interface UILabel (IPHook)
-- (void)iphook_setText:(NSString *)text;
-@end
-
-@implementation UILabel (IPHook)
-
-- (void)iphook_setText:(NSString *)text {
-    [self iphook_setText:replaceIP(text)];
-}
-
-@end
-
-#pragma mark - UIPasteboard Swizzle
-
-@interface UIPasteboard (IPHook)
-- (void)iphook_setString:(NSString *)string;
-@end
-
-@implementation UIPasteboard (IPHook)
-
-- (void)iphook_setString:(NSString *)string {
-    [self iphook_setString:replaceIP(string)];
-}
-
-@end
-
 #pragma mark - 初始化
 
 __attribute__((constructor))
 static void iphook_initialize() {
     @autoreleasepool {
         NSLog(@"========================================");
-        NSLog(@"[IPHook] 全局IP替换已加载");
+        NSLog(@"[IPHook] 雷达IP替换已加载");
         NSLog(@"[IPHook] 旧IP: %@", kOldServerIP);
         NSLog(@"[IPHook] 新IP: %@", kNewServerIP);
         NSLog(@"========================================");
         
-        // UILabel
-        swizzleMethod([UILabel class], 
-                     @selector(setText:), 
-                     @selector(iphook_setText:));
-        NSLog(@"[IPHook] UILabel hook成功");
-        
-        // UIPasteboard
-        swizzleMethod([UIPasteboard class], 
-                     @selector(setString:), 
-                     @selector(iphook_setString:));
-        NSLog(@"[IPHook] UIPasteboard hook成功");
-        
-        // RadarRelayClient (动态获取类)
+        // ========== 1. Hook 实际连接 ==========
         Class radarClass = objc_getClass("RadarRelayClient");
         if (radarClass) {
-            NSLog(@"[IPHook] 找到 RadarRelayClient 类");
-            
             SEL originalSel = @selector(initWithServerURL:room:);
             Method originalMethod = class_getInstanceMethod(radarClass, originalSel);
             
@@ -100,9 +42,7 @@ static void iphook_initialize() {
                 id (*originalFunc)(id, SEL, NSString *, NSString *) = (void *)originalImp;
                 
                 IMP swizzledImp = imp_implementationWithBlock(^id(id self, NSString *url, NSString *room) {
-                    NSLog(@"[IPHook] RadarRelayClient 原始: %@", url);
                     NSString *newUrl = replaceIP(url);
-                    NSLog(@"[IPHook] RadarRelayClient 替换: %@", newUrl);
                     return originalFunc(self, originalSel, newUrl, room);
                 });
                 
@@ -114,14 +54,37 @@ static void iphook_initialize() {
                 Method swizzledMethod = class_getInstanceMethod(radarClass, @selector(iphook_initWithServerURL:room:));
                 method_exchangeImplementations(originalMethod, swizzledMethod);
                 
-                NSLog(@"[IPHook] RadarRelayClient hook成功");
-            } else {
-                NSLog(@"[IPHook] 警告: 找不到 initWithServerURL:room: 方法");
+                NSLog(@"[IPHook] ✅ 连接hook成功");
             }
-        } else {
-            NSLog(@"[IPHook] 警告: 找不到 RadarRelayClient 类");
         }
         
-        NSLog(@"[IPHook] 所有hook已安装完成");
+        // ========== 2. Hook 显示+复制 ==========
+        Class vcClass = objc_getClass("ViewController");
+        if (vcClass) {
+            SEL shareSel = @selector(shareURLString);
+            Method shareMethod = class_getInstanceMethod(vcClass, shareSel);
+            
+            if (shareMethod) {
+                IMP originalImp = method_getImplementation(shareMethod);
+                NSString * (*originalFunc)(id, SEL) = (void *)originalImp;
+                
+                IMP swizzledImp = imp_implementationWithBlock(^NSString *(id self) {
+                    NSString *original = originalFunc(self, shareSel);
+                    return replaceIP(original);
+                });
+                
+                class_addMethod(vcClass,
+                               @selector(iphook_shareURLString),
+                               swizzledImp,
+                               method_getTypeEncoding(shareMethod));
+                
+                Method swizzledMethod = class_getInstanceMethod(vcClass, @selector(iphook_shareURLString));
+                method_exchangeImplementations(shareMethod, swizzledMethod);
+                
+                NSLog(@"[IPHook] ✅ 显示+复制hook成功");
+            }
+        }
+        
+        NSLog(@"[IPHook] 🚀 全部hook完成");
     }
 }
