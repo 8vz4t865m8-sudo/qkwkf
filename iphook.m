@@ -1,96 +1,76 @@
 #import <Foundation/Foundation.h>
-#import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 
-// ====== 配置区域 - 改成你自己的服务器 ======
-static NSString * const kOldServerIP = @"45.207.210.194";
-static NSString * const kNewServerIP = @"123.123.123.123";
-static int const kPort = 8080;
+// ====== 配置区域 - 改成你自己的房间号 ======
+static NSString * const kCustomRoomCode = @"XG8888";  // 改成你自己想要的房间号
 // ============================================
-
-#pragma mark - 辅助函数
-
-static NSString *replaceIP(NSString *str) {
-    if (!str) return str;
-    if ([str rangeOfString:kOldServerIP].location != NSNotFound) {
-        NSString *newStr = [str stringByReplacingOccurrencesOfString:kOldServerIP 
-                                                          withString:kNewServerIP];
-        NSLog(@"[IPHook] 替换: %@ -> %@", str, newStr);
-        return newStr;
-    }
-    return str;
-}
-
-static void swizzleMethod(Class class, SEL originalSel, SEL swizzledSel) {
-    Method originalMethod = class_getInstanceMethod(class, originalSel);
-    Method swizzledMethod = class_getInstanceMethod(class, swizzledSel);
-    
-    if (!originalMethod || !swizzledMethod) {
-        NSLog(@"[IPHook] 方法不存在: %@", NSStringFromSelector(originalSel));
-        return;
-    }
-    
-    method_exchangeImplementations(originalMethod, swizzledMethod);
-}
-
-#pragma mark - 1. UILabel (页面显示)
-
-@interface UILabel (IPHook)
-- (void)iphook_setText:(NSString *)text;
-@end
-
-@implementation UILabel (IPHook)
-
-- (void)iphook_setText:(NSString *)text {
-    [self iphook_setText:replaceIP(text)];
-}
-
-@end
 
 #pragma mark - 初始化
 
 __attribute__((constructor))
-static void iphook_initialize() {
+static void roomhook_initialize() {
     @autoreleasepool {
         NSLog(@"========================================");
-        NSLog(@"[IPHook] 雷达IP替换已加载");
-        NSLog(@"[IPHook] 旧IP: %@", kOldServerIP);
-        NSLog(@"[IPHook] 新IP: %@", kNewServerIP);
+        NSLog(@"[RoomHook] 房间号修改已加载");
+        NSLog(@"[RoomHook] 自定义房间号: %@", kCustomRoomCode);
         NSLog(@"========================================");
         
-        // ========== 1. UILabel (页面显示) ==========
-        swizzleMethod([UILabel class], 
-                     @selector(setText:), 
-                     @selector(iphook_setText:));
-        NSLog(@"[IPHook] ✅ 页面显示hook成功");
-        
-        // ========== 2. ViewController shareURLString (自动复制) ==========
+        // ========== Hook ViewController 的 roomCode getter ==========
         Class vcClass = objc_getClass("ViewController");
         if (vcClass) {
-            SEL shareSel = @selector(shareURLString);
-            Method shareMethod = class_getInstanceMethod(vcClass, shareSel);
+            SEL roomCodeSel = @selector(roomCode);
+            Method roomCodeMethod = class_getInstanceMethod(vcClass, roomCodeSel);
             
-            if (shareMethod) {
-                IMP originalImp = method_getImplementation(shareMethod);
+            if (roomCodeMethod) {
+                IMP originalImp = method_getImplementation(roomCodeMethod);
                 NSString * (*originalFunc)(id, SEL) = (void *)originalImp;
                 
                 IMP swizzledImp = imp_implementationWithBlock(^NSString *(id self) {
-                    NSString *original = originalFunc(self, shareSel);
-                    return replaceIP(original);
+                    // 直接返回我们自定义的房间号
+                    NSLog(@"[RoomHook] 拦截roomCode请求，返回: %@", kCustomRoomCode);
+                    return kCustomRoomCode;
                 });
                 
                 class_addMethod(vcClass,
-                               @selector(iphook_shareURLString),
+                               @selector(roomhook_roomCode),
                                swizzledImp,
-                               method_getTypeEncoding(shareMethod));
+                               method_getTypeEncoding(roomCodeMethod));
                 
-                Method swizzledMethod = class_getInstanceMethod(vcClass, @selector(iphook_shareURLString));
-                method_exchangeImplementations(shareMethod, swizzledMethod);
+                Method swizzledMethod = class_getInstanceMethod(vcClass, @selector(roomhook_roomCode));
+                method_exchangeImplementations(roomCodeMethod, swizzledMethod);
                 
-                NSLog(@"[IPHook] ✅ 自动复制hook成功");
+                NSLog(@"[RoomHook] ✅ ViewController roomCode hook成功");
             }
         }
         
-        NSLog(@"[IPHook] 🚀 全部hook完成");
+        // ========== Hook RadarRelayClient 的 initWithServerURL:room: (双重保险) ==========
+        Class radarClass = objc_getClass("RadarRelayClient");
+        if (radarClass) {
+            SEL originalSel = @selector(initWithServerURL:room:);
+            Method originalMethod = class_getInstanceMethod(radarClass, originalSel);
+            
+            if (originalMethod) {
+                IMP originalImp = method_getImplementation(originalMethod);
+                id (*originalFunc)(id, SEL, id, NSString *) = (void *)originalImp;
+                
+                IMP swizzledImp = imp_implementationWithBlock(^id(id self, id serverURL, NSString *room) {
+                    NSLog(@"[RoomHook] 原始房间号: %@", room);
+                    NSLog(@"[RoomHook] 替换为: %@", kCustomRoomCode);
+                    return originalFunc(self, originalSel, serverURL, kCustomRoomCode);
+                });
+                
+                class_addMethod(radarClass,
+                               @selector(roomhook_initWithServerURL:room:),
+                               swizzledImp,
+                               method_getTypeEncoding(originalMethod));
+                
+                Method swizzledMethod = class_getInstanceMethod(radarClass, @selector(roomhook_initWithServerURL:room:));
+                method_exchangeImplementations(originalMethod, swizzledMethod);
+                
+                NSLog(@"[RoomHook] ✅ RadarRelayClient room hook成功");
+            }
+        }
+        
+        NSLog(@"[RoomHook] 🚀 全部hook完成");
     }
 }
