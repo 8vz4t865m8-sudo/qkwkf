@@ -2,7 +2,7 @@
 #import <objc/runtime.h>
 
 // ====== 配置区域 - 改成你自己的房间号 ======
-static NSString * const kCustomRoomCode = @"XG8888";  // 改成你自己想要的房间号
+static NSString * const kCustomRoomCode = @"E66666";  // 改成你自己想要的房间号
 // ============================================
 
 #pragma mark - 初始化
