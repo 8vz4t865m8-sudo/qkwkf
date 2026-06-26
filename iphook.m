@@ -44,6 +44,14 @@
 #define OLD_VERIFY_CLASS   "NetworkVerifyClient"
 
 // ============================================================
+// 📦 Block 类型定义
+// ============================================================
+
+// 注意：这里假设旧验证的 completion 格式是 (BOOL success, NSString *error)
+// 如果实际格式不同，需要调整
+typedef void (^VerifyCompletionBlock)(BOOL success, NSString * _Nullable error);
+
+// ============================================================
 // 📦 全局状态
 // ============================================================
 
@@ -83,21 +91,6 @@ static IMP orig_logout = NULL;
         } \
     } while(0)
 
-// 安全调用 completion block
-static void callCompletion(id completion, BOOL success, NSString *error) {
-    if (!completion) return;
-    
-    // 定义 block 类型
-    typedef void (^CompletionBlock)(BOOL success, NSString *error);
-    
-    @try {
-        CompletionBlock block = (__bridge CompletionBlock)completion;
-        block(success, error);
-    } @catch (NSException *e) {
-        NSLog(@"[IPHook] ⚠️ completion 调用失败: %@", e);
-    }
-}
-
 // ============================================================
 // 🚀 T3 初始化
 // ============================================================
@@ -130,10 +123,10 @@ static void initT3() {
 // 🎣 Hook: 卡密激活/验证
 // ============================================================
 
-static void hook_activateWithCardNo_machineId_completion(id self, SEL _cmd, 
-                                                          NSString *cardNo, 
-                                                          NSString *machineId, 
-                                                          id completion) {
+static void hook_activateWithCardNo(id self, SEL _cmd, 
+                                     NSString *cardNo, 
+                                     NSString *machineId, 
+                                     VerifyCompletionBlock completion) {
     NSLog(@"[IPHook] 拦截卡密验证: %@", cardNo);
     
     // 确保 T3 已初始化
@@ -142,7 +135,7 @@ static void hook_activateWithCardNo_machineId_completion(id self, SEL _cmd,
         if (!g_t3InitSuccess) {
             NSLog(@"[IPHook] ✗ T3 未初始化，调用原验证方法");
             if (orig_activateWithCardNo) {
-                ((void(*)(id, SEL, NSString*, NSString*, id))orig_activateWithCardNo)
+                ((void(*)(id, SEL, NSString*, NSString*, VerifyCompletionBlock))orig_activateWithCardNo)
                     (self, _cmd, cardNo, machineId, completion);
             }
             return;
@@ -185,7 +178,9 @@ static void hook_activateWithCardNo_machineId_completion(id self, SEL _cmd,
                 }
                 
                 // 调用 completion
-                callCompletion(completion, YES, nil);
+                if (completion) {
+                    completion(YES, nil);
+                }
                 
             } else {
                 NSLog(@"[IPHook] ✗ T3 验证失败: %@", result.error);
@@ -199,7 +194,9 @@ static void hook_activateWithCardNo_machineId_completion(id self, SEL _cmd,
                 }
                 
                 // 调用 completion
-                callCompletion(completion, NO, result.error);
+                if (completion) {
+                    completion(NO, result.error);
+                }
             }
         });
     });
@@ -209,12 +206,14 @@ static void hook_activateWithCardNo_machineId_completion(id self, SEL _cmd,
 // 🎣 Hook: 心跳验证
 // ============================================================
 
-static void hook_heartbeatWithCompletion(id self, SEL _cmd, id completion) {
+static void hook_heartbeat(id self, SEL _cmd, VerifyCompletionBlock completion) {
     NSLog(@"[IPHook] 拦截心跳验证");
     
     if (!g_isActivated || !g_t3InitSuccess) {
         NSLog(@"[IPHook] ⚠️ 未激活或 T3 未初始化，跳过心跳");
-        callCompletion(completion, NO, @"未激活");
+        if (completion) {
+            completion(NO, @"未激活");
+        }
         return;
     }
     
@@ -228,10 +227,14 @@ static void hook_heartbeatWithCompletion(id self, SEL _cmd, id completion) {
             
             if (result.success) {
                 NSLog(@"[IPHook] ✓ 心跳成功");
-                callCompletion(completion, YES, nil);
+                if (completion) {
+                    completion(YES, nil);
+                }
             } else {
                 NSLog(@"[IPHook] ✗ 心跳失败: %@", result.error);
-                callCompletion(completion, NO, result.error);
+                if (completion) {
+                    completion(NO, result.error);
+                }
             }
         });
     });
@@ -316,31 +319,31 @@ static void initHooks() {
     
     // Hook 卡密验证
     HOOK_METHOD(OLD_VERIFY_CLASS, @selector(activateWithCardNo:machineId:completion:), 
-                hook_activateWithCardNo_machineId_completion, orig_activateWithCardNo);
+                (IMP)hook_activateWithCardNo, orig_activateWithCardNo);
     
     // Hook 心跳
     HOOK_METHOD(OLD_VERIFY_CLASS, @selector(heartbeatWithCompletion:), 
-                hook_heartbeatWithCompletion, orig_heartbeatWithCompletion);
+                (IMP)hook_heartbeat, orig_heartbeatWithCompletion);
     
     // Hook 开始心跳
     HOOK_METHOD(OLD_VERIFY_CLASS, @selector(startHeartbeat), 
-                hook_startHeartbeat, orig_startHeartbeat);
+                (IMP)hook_startHeartbeat, orig_startHeartbeat);
     
     // Hook 停止心跳
     HOOK_METHOD(OLD_VERIFY_CLASS, @selector(stopHeartbeat), 
-                hook_stopHeartbeat, orig_stopHeartbeat);
+                (IMP)hook_stopHeartbeat, orig_stopHeartbeat);
     
     // Hook 激活状态
     HOOK_METHOD(OLD_VERIFY_CLASS, @selector(isActivated), 
-                hook_isActivated, orig_isActivated);
+                (IMP)hook_isActivated, orig_isActivated);
     
     // Hook 卡号
     HOOK_METHOD(OLD_VERIFY_CLASS, @selector(cardNo), 
-                hook_cardNo, orig_cardNo);
+                (IMP)hook_cardNo, orig_cardNo);
     
     // Hook 登出
     HOOK_METHOD(OLD_VERIFY_CLASS, @selector(logout), 
-                hook_logout, orig_logout);
+                (IMP)hook_logout, orig_logout);
     
     // 初始化 T3 SDK
     initT3();
