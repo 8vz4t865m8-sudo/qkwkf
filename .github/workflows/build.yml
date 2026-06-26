@@ -11,28 +11,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Compile iphook dylib
+      - name: 编译 dylib
         run: |
           clang -arch arm64 \
             -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
             -framework UIKit \
             -framework Foundation \
+            -framework Security \
             -Wno-deprecated-declarations \
             -Wno-objc-missing-super-calls \
             -miphoneos-version-min=15.0 \
             -fobjc-arc \
             -dynamiclib \
-            iphook.m \
+            iphook.m T3Verify.m \
             -o iphook.dylib
           echo "Dylib size: $(ls -lh iphook.dylib)"
 
-      - name: Sign dylib
+      - name: 签名
         run: |
           brew install ldid
           ldid -S iphook.dylib
           echo "签名完成"
 
-      - name: Upload dylib
+      - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
           name: iphook
