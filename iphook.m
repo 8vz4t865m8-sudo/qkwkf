@@ -161,18 +161,13 @@ static BOOL hook_isActivated(id self, SEL _cmd) {
 // 🎣 Hook: 心跳验证
 // ============================================================
 
-// 用最简单的方式，假设只有一个 completion 参数
-// 我们直接调用它返回成功
+// 用最简单的方式，直接返回成功
 static void hook_heartbeatWithCompletion(id self, SEL _cmd, id completion) {
-    // 如果 T3 已经验证通过，这里可以不做任何事
-    // 因为我们自己有心跳定时器
-    
-    // 为了保险，还是调用一下 completion 返回成功
+    // 我们自己维护心跳，这里直接返回成功就行
     if (completion) {
-        // 用最简单的方式调用，假设是一个无参数的 block？
-        // 不对，还是用原来的方式，但是用 @try 保护
         @try {
-            // 假设是 (BOOL, NSString *) 格式
+            // 尝试用多种方式调用，防止崩溃
+            // 方式1：假设是 (BOOL, NSString *) 格式
             void (*func)(id, BOOL, NSString *) = (__bridge void *)completion;
             if (func) {
                 func(completion, YES, nil);
@@ -190,6 +185,12 @@ static void hook_heartbeatWithCompletion(id self, SEL _cmd, id completion) {
 static id hook_cardNo(id self, SEL _cmd) {
     return g_cardNo ?: @"T3-Verified";
 }
+
+// ============================================================
+// 📝 验证卡密
+// ============================================================
+
+static void verifyKami(NSString *kami, UIViewController *fromVC);
 
 // ============================================================
 // 📝 弹出验证窗口
@@ -230,25 +231,27 @@ static void showVerifyAlert() {
                 return;
             }
             
-            // 开始验证
-            [self verifyKami:kami fromVC:topVC];
+            // 开始验证（直接调用函数，不用 self）
+            verifyKami(kami, topVC);
         }];
         
         [alert addAction:verifyAction];
         
-        // 取消按钮（不验证就退出？或者留着以后验证？）
+        // 取消按钮
         UIAlertAction *cancelAction = [UIAlertAction actionWithTitle:@"稍后验证"
                                                                style:UIAlertActionStyleCancel
                                                              handler:^(UIAlertAction * _Nonnull action) {
             NSLog(@"[IPHook] 用户选择稍后验证");
-            // 不验证的话，应用虽然能进主界面，但可能功能用不了
-            // 这里可以根据需要调整
         }];
         [alert addAction:cancelAction];
         
         [topVC presentViewController:alert animated:YES completion:nil];
     });
 }
+
+// ============================================================
+// 📝 验证卡密实现
+// ============================================================
 
 static void verifyKami(NSString *kami, UIViewController *fromVC) {
     NSLog(@"[IPHook] 开始验证卡密: %@", kami);
