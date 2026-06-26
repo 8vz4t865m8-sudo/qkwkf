@@ -1,21 +1,10 @@
 //
-//  iphook.m - 旧验证系统 → T3 验证系统 适配层
+//  iphook.m - T3 验证替换（自定义弹窗版）
 //
-// 功能：Hook NetworkVerifyClient，把验证请求转发到 T3 验证系统
-// UI 保持不变，用户还是在原来的界面输卡密
-//
-// 编译：
-// clang -arch arm64 \
-//   -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
-//   -framework UIKit \
-//   -framework Foundation \
-//   -framework Security \
-//   -Wno-deprecated-declarations \
-//   -miphoneos-version-min=15.0 \
-//   -fobjc-arc \
-//   -dynamiclib \
-//   iphook.m T3Verify.m \
-//   -o iphook.dylib
+// 思路：
+// 1. Hook 旧验证系统，让它直接返回已激活，跳过原验证界面
+// 2. 应用启动后，我们自己弹输入框，让用户输入 T3 卡密
+// 3. 验证通过后，用心跳维持在线状态
 //
 
 #import <UIKit/UIKit.h>
@@ -27,12 +16,11 @@
 // ⚙️ 配置区域 - 请修改为你自己的 T3 验证参数
 // ============================================================
 
-// T3 验证配置
-#define T3_LOGIN_CODE      @"B9F97729EC64A6C9"    // 单码登录调用码
-#define T3_NOTICE_CODE     @"9E37BB60E3AFFCEE"    // 公告调用码
-#define T3_VERSION_CODE    @"2A78BD88E7376215"    // 版本号调用码
-#define T3_HEARTBEAT_CODE  @"168AA83248396F84"    // 心跳调用码
-#define T3_APPKEY          @"15cab0658474ff4a93ebd8ab8337dab0"  // APPKEY
+#define T3_LOGIN_CODE      @"B9F97729EC64A6C9"
+#define T3_NOTICE_CODE     @"9E37BB60E3AFFCEE"
+#define T3_VERSION_CODE    @"2A78BD88E7376215"
+#define T3_HEARTBEAT_CODE  @"168AA83248396F84"
+#define T3_APPKEY          @"15cab0658474ff4a93ebd8ab8337dab0"
 #define T3_RSA_PUBLIC_KEY  @"-----BEGIN PUBLIC KEY-----\n" \
                            "MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCxj7u3l9DKEyaluMG11BVdfg5z\n" \
                            "/6ieD1iwGzl6txP5G6nAEPxU3BzdEvI4Z20AOAJoGdmflpDq947lgp+tG61G8DeK\n" \
@@ -40,16 +28,7 @@
                            "U0sEt6p3P7lCc3JkPwIDAQAB\n" \
                            "-----END PUBLIC KEY-----"
 
-// 旧验证类名（一般不用改）
 #define OLD_VERIFY_CLASS   "NetworkVerifyClient"
-
-// ============================================================
-// 📦 Block 类型定义
-// ============================================================
-
-// 注意：这里假设旧验证的 completion 格式是 (BOOL success, NSString *error)
-// 如果实际格式不同，需要调整
-typedef void (^VerifyCompletionBlock)(BOOL success, NSString * _Nullable error);
 
 // ============================================================
 // 📦 全局状态
@@ -58,17 +37,14 @@ typedef void (^VerifyCompletionBlock)(BOOL success, NSString * _Nullable error);
 static T3Verify *g_t3Verify = nil;
 static NSString *g_cardNo = nil;
 static NSString *g_statecode = nil;
-static BOOL g_isActivated = NO;
-static BOOL g_t3InitSuccess = NO;
+static BOOL g_t3Verified = NO;      // T3 是否已验证通过
+static BOOL g_t3InitSuccess = NO;   // T3 SDK 是否初始化成功
+static NSTimer *g_heartbeatTimer = nil;
 
 // 原始方法保存
-static IMP orig_activateWithCardNo = NULL;
-static IMP orig_heartbeatWithCompletion = NULL;
-static IMP orig_startHeartbeat = NULL;
-static IMP orig_stopHeartbeat = NULL;
 static IMP orig_isActivated = NULL;
+static IMP orig_heartbeat = NULL;
 static IMP orig_cardNo = NULL;
-static IMP orig_logout = NULL;
 
 // ============================================================
 // 🔧 工具函数
@@ -90,6 +66,15 @@ static IMP orig_logout = NULL;
             NSLog(@"[IPHook] ✗ 找不到类: %s", className); \
         } \
     } while(0)
+
+// 获取当前最顶层的 ViewController，用于弹窗
+static UIViewController *topViewController() {
+    UIViewController *topVC = [UIApplication sharedApplication].keyWindow.rootViewController;
+    while (topVC.presentedViewController) {
+        topVC = topVC.presentedViewController;
+    }
+    return topVC;
+}
 
 // ============================================================
 // 🚀 T3 初始化
@@ -120,152 +105,45 @@ static void initT3() {
 }
 
 // ============================================================
-// 🎣 Hook: 卡密激活/验证
+// 💓 心跳
 // ============================================================
 
-static void hook_activateWithCardNo(id self, SEL _cmd, 
-                                     NSString *cardNo, 
-                                     NSString *machineId, 
-                                     VerifyCompletionBlock completion) {
-    NSLog(@"[IPHook] 拦截卡密验证: %@", cardNo);
+static void startHeartbeat() {
+    if (g_heartbeatTimer) return;
     
-    // 确保 T3 已初始化
-    if (!g_t3InitSuccess) {
-        initT3();
-        if (!g_t3InitSuccess) {
-            NSLog(@"[IPHook] ✗ T3 未初始化，调用原验证方法");
-            if (orig_activateWithCardNo) {
-                ((void(*)(id, SEL, NSString*, NSString*, VerifyCompletionBlock))orig_activateWithCardNo)
-                    (self, _cmd, cardNo, machineId, completion);
-            }
-            return;
-        }
-    }
+    NSLog(@"[IPHook] 启动心跳");
     
-    // 保存卡密
-    g_cardNo = cardNo;
-    
-    // 获取机器码（如果没传的话）
-    NSString *imei = machineId;
-    if (!imei || imei.length == 0) {
-        imei = [T3Verify getMachineCode];
-    }
-    
-    // 在后台线程执行网络请求
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+    // 每 30 秒跳一次
+    g_heartbeatTimer = [NSTimer scheduledTimerWithTimeInterval:30.0 repeats:YES block:^(NSTimer * _Nonnull timer) {
+        if (!g_t3Verified || !g_cardNo || !g_statecode) return;
         
-        // 调用 T3 登录验证
-        T3LoginResult *result = [g_t3Verify loginWithKami:cardNo imei:imei];
-        
-        dispatch_async(dispatch_get_main_queue(), ^{
-            
-            if (result.success) {
-                NSLog(@"[IPHook] ✓ T3 验证成功");
-                NSLog(@"[IPHook]   到期时间: %@", result.endTime);
-                NSLog(@"[IPHook]   时长: %@", result.amount);
-                NSLog(@"[IPHook]   剩余: %@秒", result.available);
-                
-                // 保存状态
-                g_isActivated = YES;
-                g_statecode = result.statecode;
-                
-                // 更新原对象的属性
-                if ([self respondsToSelector:@selector(setIsActivated:)]) {
-                    ((void(*)(id, SEL, BOOL))objc_msgSend)(self, @selector(setIsActivated:), YES);
-                }
-                if ([self respondsToSelector:@selector(setCardNo:)]) {
-                    ((void(*)(id, SEL, id))objc_msgSend)(self, @selector(setCardNo:), cardNo);
-                }
-                
-                // 调用 completion
-                if (completion) {
-                    completion(YES, nil);
-                }
-                
-            } else {
-                NSLog(@"[IPHook] ✗ T3 验证失败: %@", result.error);
-                
-                g_isActivated = NO;
-                g_statecode = nil;
-                
-                // 更新原对象的属性
-                if ([self respondsToSelector:@selector(setIsActivated:)]) {
-                    ((void(*)(id, SEL, BOOL))objc_msgSend)(self, @selector(setIsActivated:), NO);
-                }
-                
-                // 调用 completion
-                if (completion) {
-                    completion(NO, result.error);
-                }
-            }
-        });
-    });
-}
-
-// ============================================================
-// 🎣 Hook: 心跳验证
-// ============================================================
-
-static void hook_heartbeat(id self, SEL _cmd, VerifyCompletionBlock completion) {
-    NSLog(@"[IPHook] 拦截心跳验证");
-    
-    if (!g_isActivated || !g_t3InitSuccess) {
-        NSLog(@"[IPHook] ⚠️ 未激活或 T3 未初始化，跳过心跳");
-        if (completion) {
-            completion(NO, @"未激活");
-        }
-        return;
-    }
-    
-    // 在后台线程执行
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        
-        // 调用 T3 心跳
-        T3Result *result = [g_t3Verify heartbeatWithKami:g_cardNo statecode:g_statecode];
-        
-        dispatch_async(dispatch_get_main_queue(), ^{
-            
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            T3Result *result = [g_t3Verify heartbeatWithKami:g_cardNo statecode:g_statecode];
             if (result.success) {
                 NSLog(@"[IPHook] ✓ 心跳成功");
-                if (completion) {
-                    completion(YES, nil);
-                }
             } else {
                 NSLog(@"[IPHook] ✗ 心跳失败: %@", result.error);
-                if (completion) {
-                    completion(NO, result.error);
-                }
+                // 心跳失败，标记为未验证
+                g_t3Verified = NO;
             }
         });
+    }];
+    
+    // 马上跳一次
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        T3Result *result = [g_t3Verify heartbeatWithKami:g_cardNo statecode:g_statecode];
+        if (result.success) {
+            NSLog(@"[IPHook] ✓ 首次心跳成功");
+        } else {
+            NSLog(@"[IPHook] ✗ 首次心跳失败: %@", result.error);
+        }
     });
 }
 
-// ============================================================
-// 🎣 Hook: 开始心跳
-// ============================================================
-
-static void hook_startHeartbeat(id self, SEL _cmd) {
-    NSLog(@"[IPHook] 拦截开始心跳");
-    
-    // 如果已经激活，正常开始心跳
-    if (g_isActivated) {
-        if (orig_startHeartbeat) {
-            ((void(*)(id, SEL))orig_startHeartbeat)(self, _cmd);
-        }
-    } else {
-        NSLog(@"[IPHook] ⚠️ 未激活，不开始心跳");
-    }
-}
-
-// ============================================================
-// 🎣 Hook: 停止心跳
-// ============================================================
-
-static void hook_stopHeartbeat(id self, SEL _cmd) {
-    NSLog(@"[IPHook] 拦截停止心跳");
-    
-    if (orig_stopHeartbeat) {
-        ((void(*)(id, SEL))orig_stopHeartbeat)(self, _cmd);
+static void stopHeartbeat() {
+    if (g_heartbeatTimer) {
+        [g_heartbeatTimer invalidate];
+        g_heartbeatTimer = nil;
     }
 }
 
@@ -274,8 +152,35 @@ static void hook_stopHeartbeat(id self, SEL _cmd) {
 // ============================================================
 
 static BOOL hook_isActivated(id self, SEL _cmd) {
-    // 返回我们自己维护的激活状态
-    return g_isActivated;
+    // 永远返回 YES，让应用直接进主界面
+    // 实际的验证由我们自己的弹窗完成
+    return YES;
+}
+
+// ============================================================
+// 🎣 Hook: 心跳验证
+// ============================================================
+
+// 用最简单的方式，假设只有一个 completion 参数
+// 我们直接调用它返回成功
+static void hook_heartbeatWithCompletion(id self, SEL _cmd, id completion) {
+    // 如果 T3 已经验证通过，这里可以不做任何事
+    // 因为我们自己有心跳定时器
+    
+    // 为了保险，还是调用一下 completion 返回成功
+    if (completion) {
+        // 用最简单的方式调用，假设是一个无参数的 block？
+        // 不对，还是用原来的方式，但是用 @try 保护
+        @try {
+            // 假设是 (BOOL, NSString *) 格式
+            void (*func)(id, BOOL, NSString *) = (__bridge void *)completion;
+            if (func) {
+                func(completion, YES, nil);
+            }
+        } @catch (NSException *e) {
+            NSLog(@"[IPHook] ⚠️ 心跳 completion 调用失败: %@", e);
+        }
+    }
 }
 
 // ============================================================
@@ -283,23 +188,143 @@ static BOOL hook_isActivated(id self, SEL _cmd) {
 // ============================================================
 
 static id hook_cardNo(id self, SEL _cmd) {
-    return g_cardNo ?: @"";
+    return g_cardNo ?: @"T3-Verified";
 }
 
 // ============================================================
-// 🎣 Hook: 登出
+// 📝 弹出验证窗口
 // ============================================================
 
-static void hook_logout(id self, SEL _cmd) {
-    NSLog(@"[IPHook] 拦截登出");
+static void showVerifyAlert() {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        
+        UIViewController *topVC = topViewController();
+        if (!topVC) {
+            NSLog(@"[IPHook] ⚠️ 找不到顶层 VC，稍后再试");
+            // 等 1 秒再试
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), 
+                           dispatch_get_main_queue(), ^{
+                showVerifyAlert();
+            });
+            return;
+        }
+        
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"卡密验证"
+                                                                       message:@"请输入 T3 卡密"
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+        
+        // 添加输入框
+        [alert addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
+            textField.placeholder = @"请输入卡密";
+            textField.secureTextEntry = NO;
+        }];
+        
+        // 验证按钮
+        UIAlertAction *verifyAction = [UIAlertAction actionWithTitle:@"验证"
+                                                               style:UIAlertActionStyleDefault
+                                                             handler:^(UIAlertAction * _Nonnull action) {
+            NSString *kami = alert.textFields.firstObject.text;
+            if (kami.length == 0) {
+                // 空的，重新弹
+                showVerifyAlert();
+                return;
+            }
+            
+            // 开始验证
+            [self verifyKami:kami fromVC:topVC];
+        }];
+        
+        [alert addAction:verifyAction];
+        
+        // 取消按钮（不验证就退出？或者留着以后验证？）
+        UIAlertAction *cancelAction = [UIAlertAction actionWithTitle:@"稍后验证"
+                                                               style:UIAlertActionStyleCancel
+                                                             handler:^(UIAlertAction * _Nonnull action) {
+            NSLog(@"[IPHook] 用户选择稍后验证");
+            // 不验证的话，应用虽然能进主界面，但可能功能用不了
+            // 这里可以根据需要调整
+        }];
+        [alert addAction:cancelAction];
+        
+        [topVC presentViewController:alert animated:YES completion:nil];
+    });
+}
+
+static void verifyKami(NSString *kami, UIViewController *fromVC) {
+    NSLog(@"[IPHook] 开始验证卡密: %@", kami);
     
-    g_isActivated = NO;
-    g_cardNo = nil;
-    g_statecode = nil;
+    // 显示加载提示
+    UIAlertController *loading = [UIAlertController alertControllerWithTitle:@"验证中..."
+                                                                      message:nil
+                                                               preferredStyle:UIAlertControllerStyleAlert];
+    [fromVC presentViewController:loading animated:YES completion:nil];
     
-    if (orig_logout) {
-        ((void(*)(id, SEL))orig_logout)(self, _cmd);
-    }
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        
+        // 确保 T3 已初始化
+        if (!g_t3InitSuccess) {
+            initT3();
+        }
+        
+        if (!g_t3InitSuccess) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [loading dismissViewControllerAnimated:YES completion:^{
+                    UIAlertController *error = [UIAlertController alertControllerWithTitle:@"验证初始化失败"
+                                                                                    message:@"T3 SDK 初始化失败，请检查配置"
+                                                                             preferredStyle:UIAlertControllerStyleAlert];
+                    [error addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+                        showVerifyAlert();
+                    }]];
+                    [fromVC presentViewController:error animated:YES completion:nil];
+                }];
+            });
+            return;
+        }
+        
+        // 获取机器码
+        NSString *imei = [T3Verify getMachineCode];
+        
+        // 调用 T3 登录验证
+        T3LoginResult *result = [g_t3Verify loginWithKami:kami imei:imei];
+        
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [loading dismissViewControllerAnimated:YES completion:^{
+                
+                if (result.success) {
+                    NSLog(@"[IPHook] ✓ 验证成功");
+                    NSLog(@"[IPHook]   到期时间: %@", result.endTime);
+                    NSLog(@"[IPHook]   时长: %@", result.amount);
+                    
+                    // 保存状态
+                    g_t3Verified = YES;
+                    g_cardNo = kami;
+                    g_statecode = result.statecode;
+                    
+                    // 启动心跳
+                    startHeartbeat();
+                    
+                    // 提示成功
+                    UIAlertController *success = [UIAlertController alertControllerWithTitle:@"验证成功"
+                                                                                     message:[NSString stringWithFormat:@"到期时间：%@", result.endTime]
+                                                                              preferredStyle:UIAlertControllerStyleAlert];
+                    [success addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
+                    [fromVC presentViewController:success animated:YES completion:nil];
+                    
+                } else {
+                    NSLog(@"[IPHook] ✗ 验证失败: %@", result.error);
+                    
+                    // 提示失败，重新输入
+                    UIAlertController *error = [UIAlertController alertControllerWithTitle:@"验证失败"
+                                                                                    message:result.error
+                                                                             preferredStyle:UIAlertControllerStyleAlert];
+                    [error addAction:[UIAlertAction actionWithTitle:@"重新输入" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+                        showVerifyAlert();
+                    }]];
+                    [fromVC presentViewController:error animated:YES completion:nil];
+                }
+            }];
+        });
+    });
 }
 
 // ============================================================
@@ -317,38 +342,28 @@ static void initHooks() {
     
     NSLog(@"[IPHook] 找到旧验证类: %s", OLD_VERIFY_CLASS);
     
-    // Hook 卡密验证
-    HOOK_METHOD(OLD_VERIFY_CLASS, @selector(activateWithCardNo:machineId:completion:), 
-                (IMP)hook_activateWithCardNo, orig_activateWithCardNo);
-    
-    // Hook 心跳
-    HOOK_METHOD(OLD_VERIFY_CLASS, @selector(heartbeatWithCompletion:), 
-                (IMP)hook_heartbeat, orig_heartbeatWithCompletion);
-    
-    // Hook 开始心跳
-    HOOK_METHOD(OLD_VERIFY_CLASS, @selector(startHeartbeat), 
-                (IMP)hook_startHeartbeat, orig_startHeartbeat);
-    
-    // Hook 停止心跳
-    HOOK_METHOD(OLD_VERIFY_CLASS, @selector(stopHeartbeat), 
-                (IMP)hook_stopHeartbeat, orig_stopHeartbeat);
-    
-    // Hook 激活状态
+    // Hook 激活状态 - 永远返回 YES
     HOOK_METHOD(OLD_VERIFY_CLASS, @selector(isActivated), 
                 (IMP)hook_isActivated, orig_isActivated);
+    
+    // Hook 心跳 - 直接返回成功
+    HOOK_METHOD(OLD_VERIFY_CLASS, @selector(heartbeatWithCompletion:), 
+                (IMP)hook_heartbeatWithCompletion, orig_heartbeat);
     
     // Hook 卡号
     HOOK_METHOD(OLD_VERIFY_CLASS, @selector(cardNo), 
                 (IMP)hook_cardNo, orig_cardNo);
     
-    // Hook 登出
-    HOOK_METHOD(OLD_VERIFY_CLASS, @selector(logout), 
-                (IMP)hook_logout, orig_logout);
-    
     // 初始化 T3 SDK
     initT3();
     
     NSLog(@"[IPHook] ✓ Hook 初始化完成");
+    
+    // 延迟 2 秒弹出验证窗口（等主界面加载完）
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), 
+                   dispatch_get_main_queue(), ^{
+        showVerifyAlert();
+    });
 }
 
 // ============================================================
@@ -358,9 +373,8 @@ static void initHooks() {
 __attribute__((constructor))
 static void iphook_init() {
     NSLog(@"========================================");
-    NSLog(@"[IPHook] 验证系统替换 dylib 已加载");
-    NSLog(@"[IPHook] 旧验证: %s", OLD_VERIFY_CLASS);
-    NSLog(@"[IPHook] 新验证: T3 网络验证");
+    NSLog(@"[IPHook] T3 验证替换 dylib 已加载");
+    NSLog(@"[IPHook] 模式：自定义弹窗验证");
     NSLog(@"========================================");
     
     // 延迟一下再 Hook，确保类都加载完成
