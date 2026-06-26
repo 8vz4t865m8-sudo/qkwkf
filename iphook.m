@@ -1,10 +1,10 @@
 //
-//  iphook.m - T3 验证替换（自定义弹窗版）
+//  iphook.m - T3 验证替换（直接进主界面版）
 //
 // 思路：
-// 1. Hook 旧验证系统，让它直接返回已激活，跳过原验证界面
-// 2. 应用启动后，我们自己弹输入框，让用户输入 T3 卡密
-// 3. 验证通过后，用心跳维持在线状态
+// 1. 直接调用 enterMainConsole 跳过验证界面
+// 2. 弹我们自己的 T3 卡密验证窗
+// 3. 验证通过后用心跳维持
 //
 
 #import <UIKit/UIKit.h>
@@ -29,6 +29,7 @@
                            "-----END PUBLIC KEY-----"
 
 #define OLD_VERIFY_CLASS   "NetworkVerifyClient"
+#define VIEW_CONTROLLER_CLASS "ViewController"
 
 // ============================================================
 // 📦 全局状态
@@ -37,12 +38,14 @@
 static T3Verify *g_t3Verify = nil;
 static NSString *g_cardNo = nil;
 static NSString *g_statecode = nil;
-static BOOL g_t3Verified = NO;      // T3 是否已验证通过
-static BOOL g_t3InitSuccess = NO;   // T3 SDK 是否初始化成功
+static BOOL g_t3Verified = NO;
+static BOOL g_t3InitSuccess = NO;
 static NSTimer *g_heartbeatTimer = nil;
+static BOOL g_hasEnteredMain = NO;  // 是否已经进入主界面
 
 // 原始方法保存
 static IMP orig_isActivated = NULL;
+static IMP orig_tryAutoActivate = NULL;
 static IMP orig_heartbeat = NULL;
 static IMP orig_cardNo = NULL;
 
@@ -67,7 +70,7 @@ static IMP orig_cardNo = NULL;
         } \
     } while(0)
 
-// 获取当前最顶层的 ViewController，用于弹窗
+// 获取当前最顶层的 ViewController
 static UIViewController *topViewController() {
     UIViewController *topVC = [UIApplication sharedApplication].keyWindow.rootViewController;
     while (topVC.presentedViewController) {
@@ -113,7 +116,6 @@ static void startHeartbeat() {
     
     NSLog(@"[IPHook] 启动心跳");
     
-    // 每 30 秒跳一次
     g_heartbeatTimer = [NSTimer scheduledTimerWithTimeInterval:30.0 repeats:YES block:^(NSTimer * _Nonnull timer) {
         if (!g_t3Verified || !g_cardNo || !g_statecode) return;
         
@@ -123,7 +125,6 @@ static void startHeartbeat() {
                 NSLog(@"[IPHook] ✓ 心跳成功");
             } else {
                 NSLog(@"[IPHook] ✗ 心跳失败: %@", result.error);
-                // 心跳失败，标记为未验证
                 g_t3Verified = NO;
             }
         });
@@ -140,34 +141,57 @@ static void startHeartbeat() {
     });
 }
 
-static void stopHeartbeat() {
-    if (g_heartbeatTimer) {
-        [g_heartbeatTimer invalidate];
-        g_heartbeatTimer = nil;
+// ============================================================
+// 📝 验证卡密（前置声明）
+// ============================================================
+
+static void verifyKami(NSString *kami, UIViewController *fromVC);
+static void showVerifyAlert();
+
+// ============================================================
+// 🎣 Hook: tryAutoActivate - 直接进入主界面
+// ============================================================
+
+static void hook_tryAutoActivate(id self, SEL _cmd) {
+    NSLog(@"[IPHook] 拦截 tryAutoActivate，直接进入主界面");
+    
+    // 直接调用 enterMainConsole 进入主界面
+    if ([self respondsToSelector:@selector(enterMainConsole)]) {
+        ((void(*)(id, SEL))objc_msgSend)(self, @selector(enterMainConsole));
+        NSLog(@"[IPHook] ✓ 已调用 enterMainConsole");
+        g_hasEnteredMain = YES;
+        
+        // 延迟 1 秒弹出我们的验证窗
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), 
+                       dispatch_get_main_queue(), ^{
+            showVerifyAlert();
+        });
+    } else {
+        NSLog(@"[IPHook] ❌ 找不到 enterMainConsole 方法");
+        // 找不到的话，还是调用原方法
+        if (orig_tryAutoActivate) {
+            ((void(*)(id, SEL))orig_tryAutoActivate)(self, _cmd);
+        }
     }
 }
 
 // ============================================================
-// 🎣 Hook: 是否已激活
+// 🎣 Hook: isActivated
 // ============================================================
 
 static BOOL hook_isActivated(id self, SEL _cmd) {
-    // 永远返回 YES，让应用直接进主界面
-    // 实际的验证由我们自己的弹窗完成
+    // 返回 YES，保险起见
     return YES;
 }
 
 // ============================================================
-// 🎣 Hook: 心跳验证
+// 🎣 Hook: 心跳
 // ============================================================
 
-// 用最简单的方式，直接返回成功
 static void hook_heartbeatWithCompletion(id self, SEL _cmd, id completion) {
-    // 我们自己维护心跳，这里直接返回成功就行
+    // 我们自己维护心跳，这里直接返回成功
     if (completion) {
         @try {
-            // 尝试用多种方式调用，防止崩溃
-            // 方式1：假设是 (BOOL, NSString *) 格式
             void (*func)(id, BOOL, NSString *) = (__bridge void *)completion;
             if (func) {
                 func(completion, YES, nil);
@@ -179,18 +203,12 @@ static void hook_heartbeatWithCompletion(id self, SEL _cmd, id completion) {
 }
 
 // ============================================================
-// 🎣 Hook: 获取卡号
+// 🎣 Hook: 卡号
 // ============================================================
 
 static id hook_cardNo(id self, SEL _cmd) {
     return g_cardNo ?: @"T3-Verified";
 }
-
-// ============================================================
-// 📝 验证卡密
-// ============================================================
-
-static void verifyKami(NSString *kami, UIViewController *fromVC);
 
 // ============================================================
 // 📝 弹出验证窗口
@@ -202,7 +220,6 @@ static void showVerifyAlert() {
         UIViewController *topVC = topViewController();
         if (!topVC) {
             NSLog(@"[IPHook] ⚠️ 找不到顶层 VC，稍后再试");
-            // 等 1 秒再试
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), 
                            dispatch_get_main_queue(), ^{
                 showVerifyAlert();
@@ -210,34 +227,33 @@ static void showVerifyAlert() {
             return;
         }
         
+        // 如果已经验证过了，就不弹了
+        if (g_t3Verified) {
+            NSLog(@"[IPHook] 已验证，不弹窗");
+            return;
+        }
+        
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"卡密验证"
                                                                        message:@"请输入 T3 卡密"
                                                                 preferredStyle:UIAlertControllerStyleAlert];
         
-        // 添加输入框
         [alert addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
             textField.placeholder = @"请输入卡密";
             textField.secureTextEntry = NO;
         }];
         
-        // 验证按钮
         UIAlertAction *verifyAction = [UIAlertAction actionWithTitle:@"验证"
                                                                style:UIAlertActionStyleDefault
                                                              handler:^(UIAlertAction * _Nonnull action) {
             NSString *kami = alert.textFields.firstObject.text;
             if (kami.length == 0) {
-                // 空的，重新弹
                 showVerifyAlert();
                 return;
             }
-            
-            // 开始验证（直接调用函数，不用 self）
             verifyKami(kami, topVC);
         }];
-        
         [alert addAction:verifyAction];
         
-        // 取消按钮
         UIAlertAction *cancelAction = [UIAlertAction actionWithTitle:@"稍后验证"
                                                                style:UIAlertActionStyleCancel
                                                              handler:^(UIAlertAction * _Nonnull action) {
@@ -256,7 +272,6 @@ static void showVerifyAlert() {
 static void verifyKami(NSString *kami, UIViewController *fromVC) {
     NSLog(@"[IPHook] 开始验证卡密: %@", kami);
     
-    // 显示加载提示
     UIAlertController *loading = [UIAlertController alertControllerWithTitle:@"验证中..."
                                                                       message:nil
                                                                preferredStyle:UIAlertControllerStyleAlert];
@@ -264,7 +279,6 @@ static void verifyKami(NSString *kami, UIViewController *fromVC) {
     
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         
-        // 确保 T3 已初始化
         if (!g_t3InitSuccess) {
             initT3();
         }
@@ -284,10 +298,7 @@ static void verifyKami(NSString *kami, UIViewController *fromVC) {
             return;
         }
         
-        // 获取机器码
         NSString *imei = [T3Verify getMachineCode];
-        
-        // 调用 T3 登录验证
         T3LoginResult *result = [g_t3Verify loginWithKami:kami imei:imei];
         
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -296,17 +307,13 @@ static void verifyKami(NSString *kami, UIViewController *fromVC) {
                 if (result.success) {
                     NSLog(@"[IPHook] ✓ 验证成功");
                     NSLog(@"[IPHook]   到期时间: %@", result.endTime);
-                    NSLog(@"[IPHook]   时长: %@", result.amount);
                     
-                    // 保存状态
                     g_t3Verified = YES;
                     g_cardNo = kami;
                     g_statecode = result.statecode;
                     
-                    // 启动心跳
                     startHeartbeat();
                     
-                    // 提示成功
                     UIAlertController *success = [UIAlertController alertControllerWithTitle:@"验证成功"
                                                                                      message:[NSString stringWithFormat:@"到期时间：%@", result.endTime]
                                                                               preferredStyle:UIAlertControllerStyleAlert];
@@ -316,7 +323,6 @@ static void verifyKami(NSString *kami, UIViewController *fromVC) {
                 } else {
                     NSLog(@"[IPHook] ✗ 验证失败: %@", result.error);
                     
-                    // 提示失败，重新输入
                     UIAlertController *error = [UIAlertController alertControllerWithTitle:@"验证失败"
                                                                                     message:result.error
                                                                              preferredStyle:UIAlertControllerStyleAlert];
@@ -337,36 +343,41 @@ static void verifyKami(NSString *kami, UIViewController *fromVC) {
 static void initHooks() {
     NSLog(@"[IPHook] 开始初始化 Hook...");
     
-    Class oldClass = objc_getClass(OLD_VERIFY_CLASS);
-    if (!oldClass) {
-        NSLog(@"[IPHook] ⚠️ 未找到旧验证类: %s", OLD_VERIFY_CLASS);
-        return;
+    // Hook ViewController 的 tryAutoActivate - 这是关键！
+    Class vcClass = objc_getClass(VIEW_CONTROLLER_CLASS);
+    if (vcClass) {
+        SEL trySel = @selector(tryAutoActivate);
+        Method m = class_getInstanceMethod(vcClass, trySel);
+        if (m) {
+            orig_tryAutoActivate = method_getImplementation(m);
+            method_setImplementation(m, (IMP)hook_tryAutoActivate);
+            NSLog(@"[IPHook] ✓ Hook: tryAutoActivate");
+        } else {
+            NSLog(@"[IPHook] ✗ 找不到 tryAutoActivate 方法");
+        }
+    } else {
+        NSLog(@"[IPHook] ✗ 找不到 ViewController 类");
     }
     
-    NSLog(@"[IPHook] 找到旧验证类: %s", OLD_VERIFY_CLASS);
-    
-    // Hook 激活状态 - 永远返回 YES
-    HOOK_METHOD(OLD_VERIFY_CLASS, @selector(isActivated), 
-                (IMP)hook_isActivated, orig_isActivated);
-    
-    // Hook 心跳 - 直接返回成功
-    HOOK_METHOD(OLD_VERIFY_CLASS, @selector(heartbeatWithCompletion:), 
-                (IMP)hook_heartbeatWithCompletion, orig_heartbeat);
-    
-    // Hook 卡号
-    HOOK_METHOD(OLD_VERIFY_CLASS, @selector(cardNo), 
-                (IMP)hook_cardNo, orig_cardNo);
+    // Hook NetworkVerifyClient
+    Class oldClass = objc_getClass(OLD_VERIFY_CLASS);
+    if (oldClass) {
+        NSLog(@"[IPHook] 找到旧验证类: %s", OLD_VERIFY_CLASS);
+        
+        HOOK_METHOD(OLD_VERIFY_CLASS, @selector(isActivated), 
+                    (IMP)hook_isActivated, orig_isActivated);
+        
+        HOOK_METHOD(OLD_VERIFY_CLASS, @selector(heartbeatWithCompletion:), 
+                    (IMP)hook_heartbeatWithCompletion, orig_heartbeat);
+        
+        HOOK_METHOD(OLD_VERIFY_CLASS, @selector(cardNo), 
+                    (IMP)hook_cardNo, orig_cardNo);
+    }
     
     // 初始化 T3 SDK
     initT3();
     
     NSLog(@"[IPHook] ✓ Hook 初始化完成");
-    
-    // 延迟 2 秒弹出验证窗口（等主界面加载完）
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), 
-                   dispatch_get_main_queue(), ^{
-        showVerifyAlert();
-    });
 }
 
 // ============================================================
@@ -377,11 +388,10 @@ __attribute__((constructor))
 static void iphook_init() {
     NSLog(@"========================================");
     NSLog(@"[IPHook] T3 验证替换 dylib 已加载");
-    NSLog(@"[IPHook] 模式：自定义弹窗验证");
+    NSLog(@"[IPHook] 模式：直接进入主界面 + 自定义验证弹窗");
     NSLog(@"========================================");
     
-    // 延迟一下再 Hook，确保类都加载完成
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), 
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), 
                    dispatch_get_main_queue(), ^{
         initHooks();
     });
