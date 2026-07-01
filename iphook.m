@@ -1,5 +1,5 @@
 //
-//  iphook.m - T3 验证替换（完全替换版）
+//  iphook.m - T3 验证替换（完全替换版 + 自动保存卡密）
 //
 // 思路：
 // 1. 用户还是在原来的界面输卡密
@@ -7,6 +7,7 @@
 // 3. 调用 T3 验证接口
 // 4. 验证成功 → 直接调用 enterMainConsole 进主界面
 // 5. 心跳也走 T3 的
+// 6. ✅ 新增：验证成功后自动保存卡密，下次启动自动填充
 //
 
 #import <UIKit/UIKit.h>
@@ -32,6 +33,11 @@
 
 #define OLD_VERIFY_CLASS   "NetworkVerifyClient"
 #define VIEW_CONTROLLER_CLASS "ViewController"
+
+// ============================================================
+// 💾 卡密持久化（自动保存）
+// ============================================================
+#define SAVED_CARD_KEY  @"com.yourapp.savedT3CardNo"
 
 // ============================================================
 // 📦 全局状态
@@ -76,12 +82,10 @@ static UIViewController *getViewController() {
     UIViewController *vc = [UIApplication sharedApplication].keyWindow.rootViewController;
     if (!vc) return nil;
     
-    // 如果是导航控制器，取 topViewController
     if ([vc isKindOfClass:[UINavigationController class]]) {
         vc = [(UINavigationController *)vc topViewController];
     }
     
-    // 递归找 presentedViewController
     while (vc.presentedViewController) {
         vc = vc.presentedViewController;
     }
@@ -121,7 +125,6 @@ static void enterMainConsole() {
         return;
     }
     
-    // 如果当前就是 ViewController，直接调用
     if ([NSStringFromClass([vc class]) isEqualToString:@"ViewController"]) {
         if ([vc respondsToSelector:@selector(enterMainConsole)]) {
             ((void(*)(id, SEL))objc_msgSend)(vc, @selector(enterMainConsole));
@@ -130,7 +133,6 @@ static void enterMainConsole() {
         }
     }
     
-    // 否则找 childViewController
     for (UIViewController *child in vc.childViewControllers) {
         if ([NSStringFromClass([child class]) isEqualToString:@"ViewController"]) {
             if ([child respondsToSelector:@selector(enterMainConsole)]) {
@@ -195,7 +197,6 @@ static void startHeartbeat() {
         });
     }];
     
-    // 马上跳一次
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         T3Result *result = [g_t3Verify heartbeatWithKami:g_cardNo statecode:g_statecode];
         if (result.success) {
@@ -210,11 +211,23 @@ static void startHeartbeat() {
 // 🎣 Hook: 卡密验证（核心！）
 // ============================================================
 
-// 注意：这里不用管原来的 completion 是什么格式，我们自己处理结果
 static void hook_activateWithCardNo(id self, SEL _cmd, 
                                      NSString *cardNo, 
                                      NSString *machineId, 
                                      id completion) {
+    // ==========================================================
+    // 1️⃣ 自动填充保存的卡密（如果传入的卡密为空）
+    // ==========================================================
+    if (!cardNo || cardNo.length == 0) {
+        NSString *saved = [[NSUserDefaults standardUserDefaults] stringForKey:SAVED_CARD_KEY];
+        if (saved.length > 0) {
+            cardNo = saved;
+            NSLog(@"[IPHook] 🔄 自动填充保存的卡密: %@", cardNo);
+        } else {
+            NSLog(@"[IPHook] ⚠️ 无保存的卡密，等待用户输入");
+        }
+    }
+    
     NSLog(@"[IPHook] 拦截卡密验证: %@", cardNo);
     NSLog(@"[IPHook] machineId: %@", machineId);
     
@@ -228,7 +241,7 @@ static void hook_activateWithCardNo(id self, SEL _cmd,
         }
     }
     
-    // 保存卡密
+    // 保存卡密（内存）
     g_cardNo = cardNo;
     
     // 获取机器码
@@ -252,6 +265,15 @@ static void hook_activateWithCardNo(id self, SEL _cmd,
                 // 保存状态
                 g_t3Verified = YES;
                 g_statecode = result.statecode;
+                
+                // ==========================================================
+                // 2️⃣ 验证成功 → 自动保存卡密到本地
+                // ==========================================================
+                if (cardNo.length > 0) {
+                    [[NSUserDefaults standardUserDefaults] setObject:cardNo forKey:SAVED_CARD_KEY];
+                    [[NSUserDefaults standardUserDefaults] synchronize];
+                    NSLog(@"[IPHook] 💾 卡密已保存到本地: %@", cardNo);
+                }
                 
                 // 更新原对象的属性（保险起见）
                 if ([self respondsToSelector:@selector(setIsActivated:)]) {
@@ -298,7 +320,6 @@ static void hook_heartbeatWithCompletion(id self, SEL _cmd, id completion) {
         return;
     }
     
-    // 在后台线程执行 T3 心跳
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         T3Result *result = [g_t3Verify heartbeatWithKami:g_cardNo statecode:g_statecode];
         
@@ -372,7 +393,7 @@ __attribute__((constructor))
 static void iphook_init() {
     NSLog(@"========================================");
     NSLog(@"[IPHook] T3 验证替换 dylib 已加载");
-    NSLog(@"[IPHook] 模式：完全替换验证逻辑");
+    NSLog(@"[IPHook] 模式：完全替换验证逻辑 + 自动保存卡密");
     NSLog(@"========================================");
     
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), 
