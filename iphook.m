@@ -1,11 +1,5 @@
 //
-//  iphook.m - T3 验证替换 + 推流修复 + 自动保存卡密增强版
-//
-// 新增：
-// ✅ 自动填充卡密输入框（看得见）
-// ✅ 启动自动验证，不用手动点
-// ✅ 修复保存/读取逻辑
-// ✅ 推流模块 card_no/machine_id 修复
+//  iphook.m - T3 验证替换 + 推流修复 + 自动保存卡密（修复编译错误版）
 //
 
 #import <UIKit/UIKit.h>
@@ -42,29 +36,40 @@ static NSString *g_statecode = nil;
 static BOOL g_t3Verified = NO;
 static BOOL g_t3InitSuccess = NO;
 static NSTimer *g_heartbeatTimer = nil;
-static BOOL g_autoLoginTried = NO; // 防止重复自动登录
+static BOOL g_autoLoginTried = NO;
 
+// 保存原始方法（每个Hook对应一个）
 static IMP orig_activateWithCardNo = NULL;
+static IMP orig_isActivated = NULL;
+static IMP orig_cardNo = NULL;
+static IMP orig_heartbeat = NULL;
 
 // ============================================================
 // 🔧 工具函数
 // ============================================================
 
-#define HOOK_METHOD(className, sel, newImp, oldImp) \
+// 安全的 Hook 宏（修复 NULL 不能赋值的问题）
+#define SAFE_HOOK(className, sel, newImp, oldImpPtr) \
     do { \
         Class cls = objc_getClass(className); \
         if (cls) { \
             Method m = class_getInstanceMethod(cls, sel); \
             if (m) { \
-                oldImp = method_getImplementation(m); \
+                if (oldImpPtr) { \
+                    *(oldImpPtr) = method_getImplementation(m); \
+                } \
                 method_setImplementation(m, (IMP)newImp); \
                 NSLog(@"[IPHook] ✓ Hook: %s", sel_getName(sel)); \
+            } else { \
+                NSLog(@"[IPHook] ✗ 找不到方法: %s", sel_getName(sel)); \
             } \
+        } else { \
+            NSLog(@"[IPHook] ✗ 找不到类: %s", className); \
         } \
     } while(0)
 
 // ============================================================
-// 💾 卡密保存与读取（修复版）
+// 💾 卡密保存与读取
 // ============================================================
 
 static void saveCardToLocal(NSString *card) {
@@ -139,7 +144,7 @@ static void startHeartbeat() {
 }
 
 // ============================================================
-// 🎯 执行验证（通用）
+// 🎯 执行验证
 // ============================================================
 
 static void doVerify(NSString *cardNo, UIViewController *vc) {
@@ -165,19 +170,15 @@ static void doVerify(NSString *cardNo, UIViewController *vc) {
                 g_t3Verified = YES;
                 g_statecode = result.statecode;
                 
-                // 验证成功 → 保存卡密
                 saveCardToLocal(cardNo);
                 
-                // 启动心跳
                 startHeartbeat();
                 
-                // 显示成功
                 Class hud = NSClassFromString(@"SVProgressHUD");
                 if (hud) {
                     @try { [hud performSelector:@selector(showSuccessWithStatus:) withObject:@"验证成功"]; } @catch (id e) {}
                 }
                 
-                // 进入主界面
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), 
                                dispatch_get_main_queue(), ^{
                     if (vc && [vc respondsToSelector:@selector(enterMainConsole)]) {
@@ -210,7 +211,6 @@ static void hook_activateWithCardNo(id self, SEL _cmd,
     
     NSLog(@"[IPHook] 拦截验证请求，卡号: %@", cardNo);
     
-    // 如果传入的卡密为空，试试用保存的
     if (!cardNo || cardNo.length == 0 || cardNo.length < 4) {
         NSString *saved = loadCardFromLocal();
         if (saved.length > 0) {
@@ -224,7 +224,6 @@ static void hook_activateWithCardNo(id self, SEL _cmd,
         return;
     }
     
-    // 获取当前 VC
     UIViewController *vc = [UIApplication sharedApplication].keyWindow.rootViewController;
     while (vc.presentedViewController) vc = vc.presentedViewController;
     
@@ -232,7 +231,7 @@ static void hook_activateWithCardNo(id self, SEL _cmd,
 }
 
 // ============================================================
-// 🎣 Hook: 其他验证相关方法
+// 🎣 Hook: 其他验证方法
 // ============================================================
 
 static BOOL hook_isActivated(id self, SEL _cmd) {
@@ -244,14 +243,13 @@ static id hook_cardNo(id self, SEL _cmd) {
 }
 
 static void hook_heartbeat(id self, SEL _cmd, id completion) {
-    // 心跳不用管，我们自己有定时器
+    // 用我们自己的心跳定时器，这里什么都不做
 }
 
 // ============================================================
-// 🎣 自动填充卡密输入框 + 自动登录
+// 🎣 自动填充 + 自动登录
 // ============================================================
 
-// 找到 ViewController 后，自动填充卡密并验证
 static void autoFillAndLogin(UIViewController *vc) {
     if (g_autoLoginTried) return;
     g_autoLoginTried = YES;
@@ -262,22 +260,19 @@ static void autoFillAndLogin(UIViewController *vc) {
         return;
     }
     
-    NSLog(@"[IPHook] 🔄 准备自动登录，卡密: %@", savedCard);
+    NSLog(@"[IPHook] 🔄 准备自动登录");
     
-    // 遍历 VC 的所有 view，找文本输入框，自动填充
-    // 这样用户能看得见卡密已经填好了
+    // 自动填充输入框
     @try {
         for (UIView *subview in vc.view.subviews) {
             if ([subview isKindOfClass:[UITextField class]]) {
                 UITextField *tf = (UITextField *)subview;
-                // 如果输入框是空的，就填充
                 if (tf.text.length == 0) {
                     tf.text = savedCard;
                     NSLog(@"[IPHook] ✏️  已自动填充卡密到输入框");
                     break;
                 }
             }
-            // 递归找子视图
             for (UIView *ssv in subview.subviews) {
                 if ([ssv isKindOfClass:[UITextField class]]) {
                     UITextField *tf = (UITextField *)ssv;
@@ -293,14 +288,13 @@ static void autoFillAndLogin(UIViewController *vc) {
         NSLog(@"[IPHook] ⚠️  填充输入框失败: %@", e);
     }
     
-    // 延迟一下再自动验证（等界面加载完）
+    // 延迟自动验证
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), 
                    dispatch_get_main_queue(), ^{
         doVerify(savedCard, vc);
     });
 }
 
-// Hook ViewController 的 viewDidAppear，自动填充并登录
 static void hook_viewDidAppear(id self, SEL _cmd, BOOL animated) {
     // 调用原方法
     struct objc_super superInfo = {
@@ -385,17 +379,17 @@ static void initHooks() {
     if (oldClass) {
         NSLog(@"[IPHook] 找到验证类: %s", OLD_VERIFY_CLASS);
         
-        HOOK_METHOD(OLD_VERIFY_CLASS, @selector(activateWithCardNo:machineId:completion:), 
-                    (IMP)hook_activateWithCardNo, orig_activateWithCardNo);
+        SAFE_HOOK(OLD_VERIFY_CLASS, @selector(activateWithCardNo:machineId:completion:), 
+                  (IMP)hook_activateWithCardNo, &orig_activateWithCardNo);
         
-        HOOK_METHOD(OLD_VERIFY_CLASS, @selector(isActivated), 
-                    (IMP)hook_isActivated, NULL);
+        SAFE_HOOK(OLD_VERIFY_CLASS, @selector(isActivated), 
+                  (IMP)hook_isActivated, &orig_isActivated);
         
-        HOOK_METHOD(OLD_VERIFY_CLASS, @selector(cardNo), 
-                    (IMP)hook_cardNo, NULL);
+        SAFE_HOOK(OLD_VERIFY_CLASS, @selector(cardNo), 
+                  (IMP)hook_cardNo, &orig_cardNo);
         
-        HOOK_METHOD(OLD_VERIFY_CLASS, @selector(heartbeatWithCompletion:), 
-                    (IMP)hook_heartbeat, NULL);
+        SAFE_HOOK(OLD_VERIFY_CLASS, @selector(heartbeatWithCompletion:), 
+                  (IMP)hook_heartbeat, &orig_heartbeat);
     }
     
     // 2. ViewController 自动登录
