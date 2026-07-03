@@ -51,10 +51,24 @@ static IMP orig_isActivated = NULL;
 static IMP orig_cardNo = NULL;
 
 // ============================================================
-// 🔧 工具宏和函数
+// 🔧 工具函数
 // ============================================================
 
-#define HOOK_METHOD(className, sel, newImp, oldImp)     do {         Class cls = objc_getClass(className);         if (cls) {             Method m = class_getInstanceMethod(cls, sel);             if (m) {                 oldImp = method_getImplementation(m);                 method_setImplementation(m, (IMP)newImp);                 NSLog(@"[IPHook] Hook: %s", sel_getName(sel));             } else {                 NSLog(@"[IPHook] 找不到方法: %s", sel_getName(sel));             }         } else {             NSLog(@"[IPHook] 找不到类: %s", className);         }     } while(0)
+static void hookMethod(const char *className, SEL sel, IMP newImp, IMP *oldImp) {
+    Class cls = objc_getClass(className);
+    if (!cls) {
+        NSLog(@"[IPHook] 找不到类: %s", className);
+        return;
+    }
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) {
+        NSLog(@"[IPHook] 找不到方法: %s", sel_getName(sel));
+        return;
+    }
+    if (oldImp) *oldImp = method_getImplementation(m);
+    method_setImplementation(m, newImp);
+    NSLog(@"[IPHook] Hook: %s", sel_getName(sel));
+}
 
 static UIViewController *getViewController() {
     UIViewController *vc = [UIApplication sharedApplication].keyWindow.rootViewController;
@@ -313,30 +327,27 @@ static void initHooks() {
     NSLog(@"[IPHook] 开始初始化 Hook...");
 
     // 1. 验证 Hook
-    Class oldClass = objc_getClass(OLD_VERIFY_CLASS);
-    if (oldClass) {
-        HOOK_METHOD(OLD_VERIFY_CLASS, @selector(activateWithCardNo:machineId:completion:),
-                    (IMP)hook_activateWithCardNo, orig_activateWithCardNo);
-        HOOK_METHOD(OLD_VERIFY_CLASS, @selector(heartbeatWithCompletion:),
-                    (IMP)hook_heartbeatWithCompletion, orig_heartbeat);
-        HOOK_METHOD(OLD_VERIFY_CLASS, @selector(isActivated),
-                    (IMP)hook_isActivated, orig_isActivated);
-        HOOK_METHOD(OLD_VERIFY_CLASS, @selector(cardNo),
-                    (IMP)hook_cardNo, orig_cardNo);
-    }
+    hookMethod(OLD_VERIFY_CLASS, @selector(activateWithCardNo:machineId:completion:),
+               (IMP)hook_activateWithCardNo, &orig_activateWithCardNo);
+    hookMethod(OLD_VERIFY_CLASS, @selector(heartbeatWithCompletion:),
+               (IMP)hook_heartbeatWithCompletion, &orig_heartbeat);
+    hookMethod(OLD_VERIFY_CLASS, @selector(isActivated),
+               (IMP)hook_isActivated, &orig_isActivated);
+    hookMethod(OLD_VERIFY_CLASS, @selector(cardNo),
+               (IMP)hook_cardNo, &orig_cardNo);
 
     // 2. T3 初始化
     initT3();
 
     // 3. 云端推流 Hook
     const char *mrClass = "MRCloudRelay";
-    HOOK_METHOD(mrClass, @selector(mr_wsBase), (IMP)hook_mr_wsBase, NULL);
-    HOOK_METHOD(mrClass, @selector(mr_buildPublishWsUrl), (IMP)hook_mr_buildPublishWsUrl, NULL);
-    HOOK_METHOD(mrClass, @selector(ensureRoomWithCompletion:), (IMP)hook_ensureRoomWithCompletion, NULL);
-    HOOK_METHOD(mrClass, @selector(closeRoomWithCompletion:), (IMP)hook_closeRoomWithCompletion, NULL);
-    HOOK_METHOD(mrClass, @selector(openSharingWithCompletion:), (IMP)hook_openSharingWithCompletion, NULL);
-    HOOK_METHOD(mrClass, @selector(currentDirectWatchUrl), (IMP)hook_currentDirectWatchUrl, NULL);
-    HOOK_METHOD(mrClass, @selector(currentRoomCode), (IMP)hook_currentRoomCode, NULL);
+    hookMethod(mrClass, @selector(mr_wsBase), (IMP)hook_mr_wsBase, NULL);
+    hookMethod(mrClass, @selector(mr_buildPublishWsUrl), (IMP)hook_mr_buildPublishWsUrl, NULL);
+    hookMethod(mrClass, @selector(ensureRoomWithCompletion:), (IMP)hook_ensureRoomWithCompletion, NULL);
+    hookMethod(mrClass, @selector(closeRoomWithCompletion:), (IMP)hook_closeRoomWithCompletion, NULL);
+    hookMethod(mrClass, @selector(openSharingWithCompletion:), (IMP)hook_openSharingWithCompletion, NULL);
+    hookMethod(mrClass, @selector(currentDirectWatchUrl), (IMP)hook_currentDirectWatchUrl, NULL);
+    hookMethod(mrClass, @selector(currentRoomCode), (IMP)hook_currentRoomCode, NULL);
 
     NSLog(@"[IPHook] 全部 Hook 初始化完成");
 }
