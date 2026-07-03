@@ -1,12 +1,9 @@
 //
-//  MyRadarHook_v3.m - T3验证替换 + 云端推流修复（方案C）
+//  MyRadarHook_v5.m - T3验证替换 + 云端推流修复（v5）
 //
-// 核心思路：
-// 1. 验证走 T3（不变）
-// 2. 推流时 ensureRoomWithCompletion: 走原逻辑（不 Hook）
-// 3. 只 Hook mr_buildPublishWsUrl → 返回自己的服务器地址
-// 4. 只 Hook mr_connectWebSocket → 连接自己的服务器
-// 5. 可选 Hook forwardPayload:length: → 观察数据
+// 核心修复：
+// forwardPayload 可能使用 MRCloudRelay 内部的 wsTask 发送数据
+// 需要在 ensureRoomWithCompletion: 里把内部 wsTask 替换成我们的
 //
 
 #import <UIKit/UIKit.h>
@@ -175,82 +172,124 @@ static BOOL hook_isActivated(id self, SEL _cmd) { return g_t3Verified; }
 static id hook_cardNo(id self, SEL _cmd) { return g_cardNo ?: @""; }
 
 // ============================================================
-// ☁️ 云端推流修复 - 方案C：只 Hook WS 连接和 URL 构建
+// ☁️ 云端推流修复 - v5
 // ============================================================
 
-// 1. 返回自己的服务器 WS 基础地址
-// 这个方法可能被 ensureRoomWithCompletion: 调用，用来构建 publishWsUrl
-static id hook_mr_wsBase(id self, SEL _cmd) { return MY_WS_BASE; }
+// 【关键】创建 WebSocket 连接到你的服务器，并设置到 MRCloudRelay 的 wsTask
+static NSURLSessionWebSocketTask* createMyWebSocketTask(NSString *room) {
+    NSString *wsUrl = [NSString stringWithFormat:@"%@/loon?room=%@", MY_WS_BASE, room ?: @"ROOM001"];
+    NSLog(@"[IPHook] 创建 WS: %@", wsUrl);
 
-// 2. 构建发布 URL（App 用这个 URL 连接 WebSocket 上传数据）
-static id hook_mr_buildPublishWsUrl(id self, SEL _cmd) {
-    NSString *room = nil;
-    if ([self respondsToSelector:@selector(roomCode)]) {
-        room = ((id(*)(id, SEL))objc_msgSend)(self, @selector(roomCode));
-    }
-    if (!room) room = @"ROOM001";
-    return [NSString stringWithFormat:@"%@/loon?room=%@", MY_WS_BASE, room];
-}
-
-// 3. 【关键】连接 WebSocket 时，使用自己的服务器地址
-// 原逻辑：ensureRoomWithCompletion: 创建房间成功后，调用 mr_connectWebSocket
-// 这里 Hook mr_connectWebSocket，让它连自己的服务器
-static void hook_mr_connectWebSocket(id self, SEL _cmd) {
-    NSLog(@"[IPHook] 拦截 WebSocket 连接");
-
-    // 获取 roomCode 和 pubToken
-    NSString *room = nil;
-    NSString *token = nil;
-    if ([self respondsToSelector:@selector(roomCode)]) {
-        room = ((id(*)(id, SEL))objc_msgSend)(self, @selector(roomCode));
-    }
-    if ([self respondsToSelector:@selector(pubToken)]) {
-        token = ((id(*)(id, SEL))objc_msgSend)(self, @selector(pubToken));
-    }
-    if (!room) room = @"ROOM001";
-    if (!token) token = @"faketoken";
-
-    // 构建自己的 WS URL
-    NSString *wsUrl = [NSString stringWithFormat:@"%@/loon?room=%@&token=%@", MY_WS_BASE, room, token];
-    NSLog(@"[IPHook] 连接自己的服务器: %@", wsUrl);
-
-    // 使用 NSURLSessionWebSocketTask 连接
     NSURL *url = [NSURL URLWithString:wsUrl];
-    NSURLSession *session = [NSURLSession sessionWithConfiguration:[NSURLSessionConfiguration defaultSessionConfiguration]];
+    NSURLSessionConfiguration *config = [NSURLSessionConfiguration defaultSessionConfiguration];
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:config];
     NSURLSessionWebSocketTask *task = [session webSocketTaskWithURL:url];
 
-    // 保存 task
-    if ([self respondsToSelector:@selector(setWsTask:)]) {
-        ((void(*)(id, SEL, id))objc_msgSend)(self, @selector(setWsTask:), task);
-    }
-    if ([self respondsToSelector:@selector(setWsConnecting:)]) {
-        ((void(*)(id, SEL, BOOL))objc_msgSend)(self, @selector(setWsConnecting:), YES);
-    }
-
-    // 开始连接
-    [task resume];
-
-    // 模拟连接成功，调用 mr_onWebSocketReady
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-        if ([self respondsToSelector:@selector(setWsConnected:)]) {
-            ((void(*)(id, SEL, BOOL))objc_msgSend)(self, @selector(setWsConnected:), YES);
-        }
-        if ([self respondsToSelector:@selector(setWsConnecting:)]) {
-            ((void(*)(id, SEL, BOOL))objc_msgSend)(self, @selector(setWsConnecting:), NO);
-        }
-        if ([self respondsToSelector:@selector(mr_onWebSocketReady)]) {
-            ((void(*)(id, SEL))objc_msgSend)(self, @selector(mr_onWebSocketReady));
-        }
-        NSLog(@"[IPHook] WebSocket 模拟连接成功");
-    });
-
-    // 设置接收消息的 handler
-    [task receiveMessageWithCompletionHandler:^(NSURLSessionWebSocketMessage *message, NSError *error) {
-        // 处理接收到的消息（如果需要）
+    // 设置接收回调
+    [task receiveMessageWithCompletionHandler:^(NSURLSessionWebSocketMessage *msg, NSError *err) {
+        if (err) NSLog(@"[IPHook] WS 接收错误: %@", err);
+        else NSLog(@"[IPHook] WS 收到消息");
     }];
+
+    [task resume];
+    NSLog(@"[IPHook] WS 已启动");
+    return task;
 }
 
-// 4. 返回观看链接（显示在 UI 上）
+// 1. 伪造房间创建成功，并替换内部的 wsTask
+static void hook_ensureRoomWithCompletion(id self, SEL _cmd, id completion) {
+    NSString *fakeRoom = @"ROOM001";
+    NSString *watchUrl = [NSString stringWithFormat:@"%@/?game=dfm&room=%@", MY_HTTP_BASE, fakeRoom];
+
+    // 设置属性
+    if ([self respondsToSelector:@selector(setRoomCode:)]) {
+        ((void(*)(id, SEL, id))objc_msgSend)(self, @selector(setRoomCode:), fakeRoom);
+    }
+    if ([self respondsToSelector:@selector(setViewUrl:)]) {
+        ((void(*)(id, SEL, id))objc_msgSend)(self, @selector(setViewUrl:), watchUrl);
+    }
+    if ([self respondsToSelector:@selector(setDirectWatchUrl:)]) {
+        ((void(*)(id, SEL, id))objc_msgSend)(self, @selector(setDirectWatchUrl:), watchUrl);
+    }
+    if ([self respondsToSelector:@selector(setPubToken:)]) {
+        ((void(*)(id, SEL, id))objc_msgSend)(self, @selector(setPubToken:), @"faketoken");
+    }
+    if ([self respondsToSelector:@selector(setPublishWsUrl:)]) {
+        ((void(*)(id, SEL, id))objc_msgSend)(self, @selector(setPublishWsUrl:),
+            [NSString stringWithFormat:@"%@/loon?room=%@", MY_WS_BASE, fakeRoom]);
+    }
+    if ([self respondsToSelector:@selector(setCreating:)]) {
+        ((void(*)(id, SEL, BOOL))objc_msgSend)(self, @selector(setCreating:), NO);
+    }
+    if ([self respondsToSelector:@selector(setIsSharingEnabled:)]) {
+        ((void(*)(id, SEL, BOOL))objc_msgSend)(self, @selector(setIsSharingEnabled:), YES);
+    }
+    if ([self respondsToSelector:@selector(setWsConnected:)]) {
+        ((void(*)(id, SEL, BOOL))objc_msgSend)(self, @selector(setWsConnected:), YES);
+    }
+    if ([self respondsToSelector:@selector(setWsConnecting:)]) {
+        ((void(*)(id, SEL, BOOL))objc_msgSend)(self, @selector(setWsConnecting:), NO);
+    }
+
+    // 【关键】创建自己的 WS 并替换 MRCloudRelay 内部的 wsTask
+    NSURLSessionWebSocketTask *myTask = createMyWebSocketTask(fakeRoom);
+    if ([self respondsToSelector:@selector(setWsTask:)]) {
+        ((void(*)(id, SEL, id))objc_msgSend)(self, @selector(setWsTask:), myTask);
+        NSLog(@"[IPHook] 已替换 wsTask");
+    }
+
+    NSLog(@"[IPHook] 房间伪造成功: %@", fakeRoom);
+
+    // 回调
+    if (completion) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            @try {
+                ((void(^)(NSString*, NSError*))completion)(fakeRoom, nil);
+            } @catch (NSException *e) {
+                @try { ((void(^)(NSError*))completion)(nil); } @catch (NSException *e2) {}
+            }
+        });
+    }
+}
+
+// 2. 拦截数据转发，通过替换后的 wsTask 发送
+static void hook_forwardPayload(id self, SEL _cmd, const void *payload, NSUInteger length) {
+    // 获取 MRCloudRelay 内部的 wsTask（已经被替换为我们的）
+    NSURLSessionWebSocketTask *task = nil;
+    if ([self respondsToSelector:@selector(wsTask)]) {
+        task = ((id(*)(id, SEL))objc_msgSend)(self, @selector(wsTask));
+    }
+
+    if (task && task.readyState == NSURLSessionWebSocketTaskStateRunning) {
+        NSData *data = [NSData dataWithBytes:payload length:length];
+        NSString *text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+        if (text) {
+            NSURLSessionWebSocketMessage *msg = [[NSURLSessionWebSocketMessage alloc] initWithString:text];
+            [task sendMessage:msg completionHandler:^(NSError *err) {
+                if (err) NSLog(@"[IPHook] 发送失败: %@", err);
+                else NSLog(@"[IPHook] 发送成功: %lu bytes", length);
+            }];
+        }
+    } else {
+        NSLog(@"[IPHook] wsTask 不可用，尝试直接发送");
+        // 如果 wsTask 不可用，创建新的连接发送
+        NSString *room = nil;
+        if ([self respondsToSelector:@selector(roomCode)]) {
+            room = ((id(*)(id, SEL))objc_msgSend)(self, @selector(roomCode));
+        }
+        NSURLSessionWebSocketTask *newTask = createMyWebSocketTask(room ?: @"ROOM001");
+        NSData *data = [NSData dataWithBytes:payload length:length];
+        NSString *text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+        if (text) {
+            NSURLSessionWebSocketMessage *msg = [[NSURLSessionWebSocketMessage alloc] initWithString:text];
+            [newTask sendMessage:msg completionHandler:^(NSError *err) {
+                if (err) NSLog(@"[IPHook] 发送失败: %@", err);
+            }];
+        }
+    }
+}
+
+// 3. 返回观看链接
 static id hook_currentDirectWatchUrl(id self, SEL _cmd) {
     NSString *room = nil;
     if ([self respondsToSelector:@selector(roomCode)]) {
@@ -260,7 +299,7 @@ static id hook_currentDirectWatchUrl(id self, SEL _cmd) {
     return [NSString stringWithFormat:@"%@/?game=dfm&room=%@", MY_HTTP_BASE, room];
 }
 
-// 5. 返回房间码
+// 4. 返回房间码
 static id hook_currentRoomCode(id self, SEL _cmd) {
     NSString *room = nil;
     if ([self respondsToSelector:@selector(roomCode)]) {
@@ -269,13 +308,25 @@ static id hook_currentRoomCode(id self, SEL _cmd) {
     return room ?: @"ROOM001";
 }
 
+// 5. 返回 WS 基础地址
+static id hook_mr_wsBase(id self, SEL _cmd) { return MY_WS_BASE; }
+
+// 6. 构建发布 URL
+static id hook_mr_buildPublishWsUrl(id self, SEL _cmd) {
+    NSString *room = nil;
+    if ([self respondsToSelector:@selector(roomCode)]) {
+        room = ((id(*)(id, SEL))objc_msgSend)(self, @selector(roomCode));
+    }
+    if (!room) room = @"ROOM001";
+    return [NSString stringWithFormat:@"%@/loon?room=%@", MY_WS_BASE, room];
+}
+
 // ============================================================
 // 初始化
 // ============================================================
 static void initHooks() {
     NSLog(@"[IPHook] 开始初始化...");
 
-    // 1. 验证 Hook
     hookMethod(OLD_VERIFY_CLASS, @selector(activateWithCardNo:machineId:completion:),
                (IMP)hook_activateWithCardNo, &orig_activateWithCardNo);
     hookMethod(OLD_VERIFY_CLASS, @selector(heartbeatWithCompletion:),
@@ -285,27 +336,23 @@ static void initHooks() {
     hookMethod(OLD_VERIFY_CLASS, @selector(cardNo),
                (IMP)hook_cardNo, &orig_cardNo);
 
-    // 2. T3 初始化
     initT3();
 
-    // 3. 云端推流 Hook（方案C：只 Hook WS 连接相关）
-    // 不 Hook ensureRoomWithCompletion:（避免闪退）
-    // 不 Hook openSharingWithCompletion:（避免递归）
     const char *mrClass = "MRCloudRelay";
-    hookMethod(mrClass, @selector(mr_wsBase), (IMP)hook_mr_wsBase, NULL);
-    hookMethod(mrClass, @selector(mr_buildPublishWsUrl), (IMP)hook_mr_buildPublishWsUrl, NULL);
-    hookMethod(mrClass, @selector(mr_connectWebSocket), (IMP)hook_mr_connectWebSocket, NULL);
+    hookMethod(mrClass, @selector(ensureRoomWithCompletion:), (IMP)hook_ensureRoomWithCompletion, NULL);
+    hookMethod(mrClass, @selector(forwardPayload:length:), (IMP)hook_forwardPayload, NULL);
     hookMethod(mrClass, @selector(currentDirectWatchUrl), (IMP)hook_currentDirectWatchUrl, NULL);
     hookMethod(mrClass, @selector(currentRoomCode), (IMP)hook_currentRoomCode, NULL);
+    hookMethod(mrClass, @selector(mr_wsBase), (IMP)hook_mr_wsBase, NULL);
+    hookMethod(mrClass, @selector(mr_buildPublishWsUrl), (IMP)hook_mr_buildPublishWsUrl, NULL);
 
-    NSLog(@"[IPHook] 全部初始化完成（方案C）");
+    NSLog(@"[IPHook] 全部初始化完成");
 }
 
 __attribute__((constructor))
 static void iphook_init() {
     NSLog(@"========================================");
-    NSLog(@"[IPHook] T3验证+云端推流修复 v3 已加载");
-    NSLog(@"[IPHook] 方案C: 只Hook WS连接，不Hook房间创建");
+    NSLog(@"[IPHook] T3验证+云端推流修复 v5 已加载");
     NSLog(@"[IPHook] 服务器: %@", MY_HTTP_BASE);
     NSLog(@"========================================");
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.3*NSEC_PER_SEC), dispatch_get_main_queue(), ^{
