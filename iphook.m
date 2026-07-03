@@ -1,9 +1,5 @@
 //
-//  MyRadarHook_v5.m - T3验证替换 + 云端推流修复（v5）
-//
-// 核心修复：
-// forwardPayload 可能使用 MRCloudRelay 内部的 wsTask 发送数据
-// 需要在 ensureRoomWithCompletion: 里把内部 wsTask 替换成我们的
+//  MyRadarHook_v5.m - T3验证替换 + 云端推流修复（v5 修复版）
 //
 
 #import <UIKit/UIKit.h>
@@ -172,10 +168,10 @@ static BOOL hook_isActivated(id self, SEL _cmd) { return g_t3Verified; }
 static id hook_cardNo(id self, SEL _cmd) { return g_cardNo ?: @""; }
 
 // ============================================================
-// ☁️ 云端推流修复 - v5
+// ☁️ 云端推流修复
 // ============================================================
 
-// 【关键】创建 WebSocket 连接到你的服务器，并设置到 MRCloudRelay 的 wsTask
+// 创建 WebSocket 连接到你的服务器
 static NSURLSessionWebSocketTask* createMyWebSocketTask(NSString *room) {
     NSString *wsUrl = [NSString stringWithFormat:@"%@/loon?room=%@", MY_WS_BASE, room ?: @"ROOM001"];
     NSLog(@"[IPHook] 创建 WS: %@", wsUrl);
@@ -185,10 +181,8 @@ static NSURLSessionWebSocketTask* createMyWebSocketTask(NSString *room) {
     NSURLSession *session = [NSURLSession sessionWithConfiguration:config];
     NSURLSessionWebSocketTask *task = [session webSocketTaskWithURL:url];
 
-    // 设置接收回调
     [task receiveMessageWithCompletionHandler:^(NSURLSessionWebSocketMessage *msg, NSError *err) {
         if (err) NSLog(@"[IPHook] WS 接收错误: %@", err);
-        else NSLog(@"[IPHook] WS 收到消息");
     }];
 
     [task resume];
@@ -201,7 +195,6 @@ static void hook_ensureRoomWithCompletion(id self, SEL _cmd, id completion) {
     NSString *fakeRoom = @"ROOM001";
     NSString *watchUrl = [NSString stringWithFormat:@"%@/?game=dfm&room=%@", MY_HTTP_BASE, fakeRoom];
 
-    // 设置属性
     if ([self respondsToSelector:@selector(setRoomCode:)]) {
         ((void(*)(id, SEL, id))objc_msgSend)(self, @selector(setRoomCode:), fakeRoom);
     }
@@ -231,7 +224,7 @@ static void hook_ensureRoomWithCompletion(id self, SEL _cmd, id completion) {
         ((void(*)(id, SEL, BOOL))objc_msgSend)(self, @selector(setWsConnecting:), NO);
     }
 
-    // 【关键】创建自己的 WS 并替换 MRCloudRelay 内部的 wsTask
+    // 创建自己的 WS 并替换 MRCloudRelay 内部的 wsTask
     NSURLSessionWebSocketTask *myTask = createMyWebSocketTask(fakeRoom);
     if ([self respondsToSelector:@selector(setWsTask:)]) {
         ((void(*)(id, SEL, id))objc_msgSend)(self, @selector(setWsTask:), myTask);
@@ -240,7 +233,6 @@ static void hook_ensureRoomWithCompletion(id self, SEL _cmd, id completion) {
 
     NSLog(@"[IPHook] 房间伪造成功: %@", fakeRoom);
 
-    // 回调
     if (completion) {
         dispatch_async(dispatch_get_main_queue(), ^{
             @try {
@@ -254,13 +246,13 @@ static void hook_ensureRoomWithCompletion(id self, SEL _cmd, id completion) {
 
 // 2. 拦截数据转发，通过替换后的 wsTask 发送
 static void hook_forwardPayload(id self, SEL _cmd, const void *payload, NSUInteger length) {
-    // 获取 MRCloudRelay 内部的 wsTask（已经被替换为我们的）
     NSURLSessionWebSocketTask *task = nil;
     if ([self respondsToSelector:@selector(wsTask)]) {
         task = ((id(*)(id, SEL))objc_msgSend)(self, @selector(wsTask));
     }
 
-    if (task && task.readyState == NSURLSessionWebSocketTaskStateRunning) {
+    // 修复：使用 NSURLSessionTaskStateRunning 而不是 NSURLSessionWebSocketTaskStateRunning
+    if (task && task.state == NSURLSessionTaskStateRunning) {
         NSData *data = [NSData dataWithBytes:payload length:length];
         NSString *text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
         if (text) {
@@ -272,7 +264,6 @@ static void hook_forwardPayload(id self, SEL _cmd, const void *payload, NSUInteg
         }
     } else {
         NSLog(@"[IPHook] wsTask 不可用，尝试直接发送");
-        // 如果 wsTask 不可用，创建新的连接发送
         NSString *room = nil;
         if ([self respondsToSelector:@selector(roomCode)]) {
             room = ((id(*)(id, SEL))objc_msgSend)(self, @selector(roomCode));
