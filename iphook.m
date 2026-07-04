@@ -2,18 +2,18 @@
 //  MyRadarHook_v8.m - 保留原切换逻辑，只改推流目标
 //  功能：
 //    1. T3 卡密验证替换 + 自动保存/自动登录
-//    2. 保留原APP的本地/云端切换逻辑
+//    2. 保留原APP的本地/云端切换逻辑（点推流才启动云端）
 //    3. 云端推流指向你的服务器
-//    4. 不自动推流，点一下才开始
 //
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <mach/mach_time.h>
 #import "T3Verify.h"
 
 // ============================================================
-// T3 配置
+// 配置
 // ============================================================
 #define T3_LOGIN_CODE      @"B9F97729EC64A6C9"
 #define T3_NOTICE_CODE     @"9E37BB60E3AFFCEE"
@@ -28,6 +28,14 @@
 #define MY_SERVER_SCHEME   @"ws://"
 #define MY_HTTP_BASE       (@"http://" MY_SERVER_HOST @":" MY_SERVER_PORT)
 #define MY_WS_BASE         (MY_SERVER_SCHEME MY_SERVER_HOST @":" MY_SERVER_PORT)
+
+// ============================================================
+// 前置声明
+// ============================================================
+static void hookMethod(const char *className, SEL sel, IMP newImp, IMP *oldImp);
+static void setStringProp(id self, SEL sel, NSString *val);
+static void setBoolProp(id self, SEL sel, BOOL val);
+static void safeCallCompletion(id completion, NSString *fakeRoom);
 
 // ============================================================
 // 全局状态 - 验证
@@ -118,6 +126,38 @@ static void enterMainConsole() {
     }
 }
 
+static void setStringProp(id self, SEL sel, NSString *val) {
+    if ([self respondsToSelector:sel]) {
+        ((void(*)(id, SEL, id))objc_msgSend)(self, sel, val);
+    }
+}
+
+static void setBoolProp(id self, SEL sel, BOOL val) {
+    if ([self respondsToSelector:sel]) {
+        ((void(*)(id, SEL, BOOL))objc_msgSend)(self, sel, val);
+    }
+}
+
+static void safeCallCompletion(id completion, NSString *fakeRoom) {
+    if (!completion) return;
+    @try {
+        void (^block1)(NSString *, NSError *) = completion;
+        block1(fakeRoom, nil); return;
+    } @catch (NSException *e) {}
+    @try {
+        void (^block2)(id, NSError *) = completion;
+        block2(fakeRoom, nil); return;
+    } @catch (NSException *e) {}
+    @try {
+        void (^block3)(BOOL, NSError *) = completion;
+        block3(YES, nil); return;
+    } @catch (NSException *e) {}
+    @try {
+        void (^block4)(void) = completion;
+        block4(); return;
+    } @catch (NSException *e) {}
+}
+
 // ============================================================
 // 卡密保存/读取
 // ============================================================
@@ -183,7 +223,7 @@ static void hook_activateWithCardNo(id self, SEL _cmd, NSString *cardNo, NSStrin
             if (r.success) {
                 g_t3Verified = YES; g_statecode = r.statecode;
                 saveCardToLocal(cardNo, imei);
-                
+
                 if ([self respondsToSelector:@selector(setIsActivated:)]) {
                     ((void(*)(id, SEL, BOOL))objc_msgSend)(self, @selector(setIsActivated:), YES);
                 }
@@ -220,21 +260,21 @@ static id hook_cardNo(id self, SEL _cmd) { return g_cardNo ?: @""; }
 static void hook_tryAutoActivate(id self, SEL _cmd) {
     NSString *savedCard = loadSavedCard();
     NSString *savedMachineId = loadSavedMachineId();
-    
+
     if (savedCard.length > 0) {
         NSLog(@"[Hook] 自动验证保存的卡密: %@", savedCard);
         if (!g_t3InitSuccess) initT3();
-        
+
         g_cardNo = savedCard;
         NSString *imei = savedMachineId.length ? savedMachineId : [T3Verify getMachineCode];
-        
+
         dispatch_async(dispatch_get_global_queue(0,0), ^{
             T3LoginResult *r = [g_t3Verify loginWithKami:savedCard imei:imei];
             dispatch_async(dispatch_get_main_queue(), ^{
                 if (r.success) {
                     g_t3Verified = YES; g_statecode = r.statecode;
                     saveCardToLocal(savedCard, imei);
-                    
+
                     if ([self respondsToSelector:@selector(setIsActivated:)]) {
                         ((void(*)(id, SEL, BOOL))objc_msgSend)(self, @selector(setIsActivated:), YES);
                     }
@@ -258,7 +298,7 @@ static void hook_tryAutoActivate(id self, SEL _cmd) {
 }
 
 // ============================================================
-// ☁️ WebSocket 核心引擎（推流时使用）
+// WebSocket 核心引擎（推流时使用）
 // ============================================================
 static void initWsInfrastructure() {
     static dispatch_once_t once;
@@ -271,7 +311,7 @@ static void initWsInfrastructure() {
 
 static void wsSendFrameInternal(NSURLSessionWebSocketTask *task, NSData *data) {
     if (!task || task.state != NSURLSessionTaskStateRunning) return;
-    
+
     NSString *text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
     NSURLSessionWebSocketMessage *msg;
     if (text) {
@@ -279,7 +319,7 @@ static void wsSendFrameInternal(NSURLSessionWebSocketTask *task, NSData *data) {
     } else {
         msg = [[NSURLSessionWebSocketMessage alloc] initWithData:data];
     }
-    
+
     [task sendMessage:msg completionHandler:^(NSError *err) {
         if (err) {
             dispatch_async(g_wsQueue, ^{
@@ -295,16 +335,16 @@ static void wsSendFrameInternal(NSURLSessionWebSocketTask *task, NSData *data) {
 static void wsFlushPendingQueue() {
     if (!g_myWsTask || g_myWsTask.state != NSURLSessionTaskStateRunning) return;
     if (g_pendingQueue.count == 0) return;
-    
+
     NSArray *frames = nil;
     @synchronized(g_pendingQueue) {
         frames = [g_pendingQueue copy];
         [g_pendingQueue removeAllObjects];
         g_droppedFrames = 0;
     }
-    
+
     NSLog(@"[Hook] Flush %lu 帧缓存", (unsigned long)frames.count);
-    
+
     for (NSData *data in frames) {
         wsSendFrameInternal(g_myWsTask, data);
     }
@@ -315,7 +355,7 @@ static void wsStartReceiveLoop(NSURLSessionWebSocketTask *task) {
     void (^receiveBlock)(void) = ^{
         __strong NSURLSessionWebSocketTask *strongTask = weakTask;
         if (!strongTask || strongTask.state != NSURLSessionTaskStateRunning) return;
-        
+
         [strongTask receiveMessageWithCompletionHandler:^(NSURLSessionWebSocketMessage *msg, NSError *err) {
             if (err) {
                 dispatch_async(g_wsQueue, ^{
@@ -326,14 +366,14 @@ static void wsStartReceiveLoop(NSURLSessionWebSocketTask *task) {
                 });
                 return;
             }
-            
+
             if (msg.type == NSURLSessionWebSocketMessageTypeString) {
                 NSString *text = msg.string;
                 if ([text hasPrefix:@"cfg"]) {
                     NSLog(@"[Hook] 收到配置: %@", text);
                 }
             }
-            
+
             receiveBlock();
         }];
     };
@@ -346,22 +386,22 @@ static void wsConnect() {
             return;
         }
         if (g_wsState == WSStateConnecting) return;
-        
+
         uint64_t now = mach_absolute_time();
         if (now - g_lastConnectAttempt < kMinReconnectInterval) {
             return;
         }
         g_lastConnectAttempt = now;
         g_wsState = WSStateConnecting;
-        
+
         if (g_myWsTask) {
             [g_myWsTask cancel];
             g_myWsTask = nil;
         }
-        
+
         NSString *wsUrl = [NSString stringWithFormat:@"%@/loon?room=%@", MY_WS_BASE, g_fakeRoom];
         NSLog(@"[Hook] WS 连接: %@", wsUrl);
-        
+
         NSURL *url = [NSURL URLWithString:wsUrl];
         if (!g_myWsSession) {
             NSURLSessionConfiguration *config = [NSURLSessionConfiguration defaultSessionConfiguration];
@@ -369,10 +409,10 @@ static void wsConnect() {
             config.timeoutIntervalForResource = 300;
             g_myWsSession = [NSURLSession sessionWithConfiguration:config];
         }
-        
+
         NSURLSessionWebSocketTask *task = [g_myWsSession webSocketTaskWithURL:url];
         [task resume];
-        
+
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.5 * NSEC_PER_SEC), g_wsQueue, ^{
             if (task.state == NSURLSessionTaskStateRunning) {
                 NSLog(@"[Hook] WS 连接成功");
@@ -391,12 +431,12 @@ static void wsConnect() {
 
 static void wsSendOrEnqueue(NSData *data) {
     initWsInfrastructure();
-    
+
     dispatch_async(g_wsQueue, ^{
         BOOL isConnected = (g_wsState == WSStateConnected && 
                            g_myWsTask && 
                            g_myWsTask.state == NSURLSessionTaskStateRunning);
-        
+
         if (isConnected) {
             dispatch_async(g_wsSendQueue, ^{
                 wsSendFrameInternal(g_myWsTask, data);
@@ -414,7 +454,7 @@ static void wsSendOrEnqueue(NSData *data) {
                     }
                 }
             }
-            
+
             if (g_wsState == WSStateDisconnected || g_wsState == WSStateFailed) {
                 wsConnect();
             }
@@ -423,40 +463,8 @@ static void wsSendOrEnqueue(NSData *data) {
 }
 
 // ============================================================
-// MRCloudRelay Hook - 只改推流目标，不改切换逻辑
+// MRCloudRelay Hook
 // ============================================================
-static void setStringProp(id self, SEL sel, NSString *val) {
-    if ([self respondsToSelector:sel]) {
-        ((void(*)(id, SEL, id))objc_msgSend)(self, sel, val);
-    }
-}
-static void setBoolProp(id self, SEL sel, BOOL val) {
-    if ([self respondsToSelector:sel]) {
-        ((void(*)(id, SEL, BOOL))objc_msgSend)(self, sel, val);
-    }
-}
-
-static void safeCallCompletion(id completion, NSString *fakeRoom) {
-    if (!completion) return;
-    @try {
-        void (^block1)(NSString *, NSError *) = completion;
-        block1(fakeRoom, nil); return;
-    } @catch (NSException *e) {}
-    @try {
-        void (^block2)(id, NSError *) = completion;
-        block2(fakeRoom, nil); return;
-    } @catch (NSException *e) {}
-    @try {
-        void (^block3)(BOOL, NSError *) = completion;
-        block3(YES, nil); return;
-    } @catch (NSException *e) {}
-    @try {
-        void (^block4)(void) = completion;
-        block4(); return;
-    } @catch (NSException *e) {}
-}
-
-// 只改 ensureRoomWithCompletion，让它指向你的服务器
 static void hook_ensureRoomWithCompletion(id self, SEL _cmd, id completion) {
     @try {
         NSString *watchUrl = [NSString stringWithFormat:@"%@/?game=dfm&room=%@", MY_HTTP_BASE, g_fakeRoom];
@@ -480,7 +488,6 @@ static void hook_ensureRoomWithCompletion(id self, SEL _cmd, id completion) {
             ((void(*)(id, SEL, id))objc_msgSend)(self, @selector(setPendingFrames:), [NSMutableArray array]);
         }
 
-        // 预建立 WS 连接
         initWsInfrastructure();
         wsConnect();
 
@@ -489,7 +496,7 @@ static void hook_ensureRoomWithCompletion(id self, SEL _cmd, id completion) {
         dispatch_async(dispatch_get_main_queue(), ^{
             safeCallCompletion(completion, g_fakeRoom);
         });
-        
+
     } @catch (NSException *e) {
         NSLog(@"[Hook] ensureRoom 异常: %@", e);
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -498,7 +505,6 @@ static void hook_ensureRoomWithCompletion(id self, SEL _cmd, id completion) {
     }
 }
 
-// forwardPayload 直接发送到你的服务器
 static void hook_forwardPayload(id self, SEL _cmd, const void *payload, NSUInteger length) {
     @try {
         if (!payload || length == 0) return;
@@ -510,7 +516,6 @@ static void hook_forwardPayload(id self, SEL _cmd, const void *payload, NSUInteg
     }
 }
 
-// 返回你的服务器地址
 static id hook_currentDirectWatchUrl(id self, SEL _cmd) {
     return [NSString stringWithFormat:@"%@/?game=dfm&room=%@", MY_HTTP_BASE, g_fakeRoom];
 }
@@ -520,7 +525,6 @@ static id hook_mr_buildPublishWsUrl(id self, SEL _cmd) {
     return [NSString stringWithFormat:@"%@/loon?room=%@", MY_WS_BASE, g_fakeRoom];
 }
 
-// 禁用 MRCloudRelay 内部状态机（防止干扰）
 static void hook_mr_connectWebSocket(id self, SEL _cmd) {
     NSLog(@"[Hook] 拦截 mr_connectWebSocket");
     setBoolProp(self, @selector(setWsConnected:), YES);
@@ -548,6 +552,40 @@ static void hook_mr_fetchDirectWatchUrl(id self, SEL _cmd) {
 }
 
 // ============================================================
+// ViewController Hook - 补上缺失的定义
+// ============================================================
+static id hook_currentStreamWatchUrl(id self, SEL _cmd) {
+    return [NSString stringWithFormat:@"%@/?game=dfm&room=%@", MY_HTTP_BASE, g_fakeRoom];
+}
+
+static void hook_refreshCloudPanel(id self, SEL _cmd) {
+    @try {
+        if ([self respondsToSelector:@selector(cloudStatusL)]) {
+            UILabel *statusL = ((id(*)(id, SEL))objc_msgSend)(self, @selector(cloudStatusL));
+            if ([statusL respondsToSelector:@selector(setText:)]) {
+                ((void(*)(id, SEL, id))objc_msgSend)(statusL, @selector(setText:), @"云端推流已连接");
+            }
+        }
+        if ([self respondsToSelector:@selector(streamIPL)]) {
+            UILabel *ipL = ((id(*)(id, SEL))objc_msgSend)(self, @selector(streamIPL));
+            if ([ipL respondsToSelector:@selector(setText:)]) {
+                ((void(*)(id, SEL, id))objc_msgSend)(ipL, @selector(setText:), MY_SERVER_HOST);
+            }
+        }
+        if ([self respondsToSelector:@selector(streamPortL)]) {
+            UILabel *portL = ((id(*)(id, SEL))objc_msgSend)(self, @selector(streamPortL));
+            if ([portL respondsToSelector:@selector(setText:)]) {
+                ((void(*)(id, SEL, id))objc_msgSend)(portL, @selector(setText:), MY_SERVER_PORT);
+            }
+        }
+    } @catch (NSException *e) {}
+}
+
+static void hook_startStreamingWithHardcodedServer(id self, SEL _cmd) {
+    NSLog(@"[Hook] 拦截 startStreamingWithHardcodedServer");
+}
+
+// ============================================================
 // 初始化
 // ============================================================
 static void initHooks() {
@@ -569,7 +607,7 @@ static void initHooks() {
 
     initT3();
 
-    // MRCloudRelay - 只改推流目标
+    // MRCloudRelay
     const char *mrClass = "MRCloudRelay";
     hookMethod(mrClass, @selector(ensureRoomWithCompletion:), (IMP)hook_ensureRoomWithCompletion, NULL);
     hookMethod(mrClass, @selector(forwardPayload:length:), (IMP)hook_forwardPayload, NULL);
@@ -577,8 +615,7 @@ static void initHooks() {
     hookMethod(mrClass, @selector(currentRoomCode), (IMP)hook_currentRoomCode, NULL);
     hookMethod(mrClass, @selector(mr_wsBase), (IMP)hook_mr_wsBase, NULL);
     hookMethod(mrClass, @selector(mr_buildPublishWsUrl), (IMP)hook_mr_buildPublishWsUrl, NULL);
-    
-    // 禁用内部状态机
+
     hookMethod(mrClass, @selector(mr_connectWebSocket), (IMP)hook_mr_connectWebSocket, NULL);
     hookMethod(mrClass, @selector(mr_receiveLoop:), (IMP)hook_mr_receiveLoop, NULL);
     hookMethod(mrClass, @selector(mr_sendFrame:), (IMP)hook_mr_sendFrame, NULL);
@@ -588,7 +625,7 @@ static void initHooks() {
     hookMethod(mrClass, @selector(mr_requestCloseRoom:completion:), (IMP)hook_mr_requestCloseRoom, NULL);
     hookMethod(mrClass, @selector(mr_fetchDirectWatchUrl), (IMP)hook_mr_fetchDirectWatchUrl, NULL);
 
-    // ViewController - 不改本地服务相关方法！保留原切换逻辑
+    // ViewController
     const char *vcClass = "ViewController";
     hookMethod(vcClass, @selector(startStreamingWithHardcodedServer), (IMP)hook_startStreamingWithHardcodedServer, NULL);
     hookMethod(vcClass, @selector(currentStreamWatchUrl), (IMP)hook_currentStreamWatchUrl, NULL);
