@@ -395,6 +395,9 @@ static void wsFlushRingBuffer() {
 }
 
 static void wsConnect() {
+    if (!g_wsQueue) {
+        g_wsQueue = dispatch_queue_create("com.iphook.ws.core", DISPATCH_QUEUE_SERIAL);
+    }
     dispatch_async(g_wsQueue, ^{
         if (g_wsState == WSStateConnected && g_myWsTask && g_myWsTask.state == NSURLSessionTaskStateRunning) return;
         if (g_wsState == WSStateConnecting) return;
@@ -490,33 +493,46 @@ static void hook_ensureRoomWithCompletion(id self, SEL _cmd, id completion) {
 }
 
 static void hook_openSharingWithCompletion(id self, SEL _cmd, id completion) {
-    NSLog(@"[Hook] ===== 用户点击开启推流 =====");
-    g_cloudStreamingActive = YES;
+    @try {
+        NSLog(@"[Hook] ===== 用户点击开启推流 =====");
+        g_cloudStreamingActive = YES;
 
-    NSString *watchUrl = [NSString stringWithFormat:@"%@/?game=dfm&room=%@", MY_HTTP_BASE, g_fakeRoom];
-    NSString *publishUrl = [NSString stringWithFormat:@"%@/loon?room=%@", MY_WS_BASE, g_fakeRoom];
+        NSString *watchUrl = [NSString stringWithFormat:@"%@/?game=dfm&room=%@", MY_HTTP_BASE, g_fakeRoom];
+        NSString *publishUrl = [NSString stringWithFormat:@"%@/loon?room=%@", MY_WS_BASE, g_fakeRoom];
 
-    setStringProp(self, @selector(setRoomCode:), g_fakeRoom);
-    setStringProp(self, @selector(setViewUrl:), watchUrl);
-    setStringProp(self, @selector(setDirectWatchUrl:), watchUrl);
-    setStringProp(self, @selector(setPubToken:), @"faketoken");
-    setStringProp(self, @selector(setPublishWsUrl:), publishUrl);
-    setBoolProp(self, @selector(setIsSharingEnabled:), YES);
-    setBoolProp(self, @selector(setWsConnected:), YES);
-    setBoolProp(self, @selector(setWsConnecting:), NO);
-    setBoolProp(self, @selector(setCreating:), NO);
+        setStringProp(self, @selector(setRoomCode:), g_fakeRoom);
+        setStringProp(self, @selector(setViewUrl:), watchUrl);
+        setStringProp(self, @selector(setDirectWatchUrl:), watchUrl);
+        setStringProp(self, @selector(setPubToken:), @"faketoken");
+        setStringProp(self, @selector(setPublishWsUrl:), publishUrl);
+        setBoolProp(self, @selector(setIsSharingEnabled:), YES);
+        setBoolProp(self, @selector(setWsConnected:), YES);
+        setBoolProp(self, @selector(setWsConnecting:), NO);
+        setBoolProp(self, @selector(setCreating:), NO);
+        setBoolProp(self, @selector(setReconnectAttempt:), 0);
 
-    wsConnect();
-
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIViewController *vc = getViewController();
-        if (vc && [vc respondsToSelector:@selector(refreshCloudPanel)]) {
-            ((void(*)(id, SEL))objc_msgSend)(vc, @selector(refreshCloudPanel));
+        if ([self respondsToSelector:@selector(setPendingCompletions:)]) {
+            ((void(*)(id, SEL, id))objc_msgSend)(self, @selector(setPendingCompletions:), [NSMutableArray array]);
         }
-        showSuccess(@"云端推流已开启");
-    });
+        if ([self respondsToSelector:@selector(setPendingFrames:)]) {
+            ((void(*)(id, SEL, id))objc_msgSend)(self, @selector(setPendingFrames:), [NSMutableArray array]);
+        }
 
-    safeCallCompletion(completion, g_fakeRoom);
+        wsConnect();
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            UIViewController *vc = getViewController();
+            if (vc && [vc respondsToSelector:@selector(refreshCloudPanel)]) {
+                ((void(*)(id, SEL))objc_msgSend)(vc, @selector(refreshCloudPanel));
+            }
+            showSuccess(@"云端推流已开启");
+        });
+
+        safeCallCompletion(completion, g_fakeRoom);
+    } @catch (NSException *e) {
+        NSLog(@"[Hook] openSharing 异常: %@", e);
+        safeCallCompletion(completion, g_fakeRoom);
+    }
 }
 
 static void hook_startStreamingWithHardcodedServer(id self, SEL _cmd) {
