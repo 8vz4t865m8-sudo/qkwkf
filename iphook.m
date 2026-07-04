@@ -505,6 +505,16 @@ static void wsConnect() {
                 NSLog(@"[Hook] WS 连接成功");
                 g_wsState = WSStateConnected;
                 g_myWsTask = task;
+
+                // 【关键修复】设置原APP的 wsTask 为我的连接
+                // 这样原APP的状态机监控的是我的连接，而不是原服务器
+                Class mrClass = objc_getClass("MRCloudRelay");
+                id relay = ((id(*)(id, SEL))objc_msgSend)(mrClass, @selector(shared));
+                if (relay && [relay respondsToSelector:@selector(setWsTask:)]) {
+                    ((void(*)(id, SEL, id))objc_msgSend)(relay, @selector(setWsTask:), task);
+                    NSLog(@"[Hook] 已设置原APP wsTask 为我的连接");
+                }
+
                 wsStartReceiveLoop(task);
                 startWsHeartbeat();  // 启动心跳保活
                 wsFlushRingBuffer();
@@ -557,6 +567,14 @@ static void hook_ensureRoomWithCompletion(id self, SEL _cmd, id completion) {
 
     g_cloudStreamingActive = NO;
     stopWsHeartbeat();  // 确保心跳停止
+
+    // 清理原APP的 wsTask
+    Class mrClass = objc_getClass("MRCloudRelay");
+    id relay = ((id(*)(id, SEL))objc_msgSend)(mrClass, @selector(shared));
+    if (relay && [relay respondsToSelector:@selector(setWsTask:)]) {
+        ((void(*)(id, SEL, id))objc_msgSend)(relay, @selector(setWsTask:), nil);
+    }
+
     if (g_myWsTask) {
         [g_myWsTask cancel];
         g_myWsTask = nil;
@@ -641,6 +659,13 @@ static void hook_closeRoomWithCompletion(id self, SEL _cmd, id completion) {
     NSLog(@"[Hook] ===== 用户点击停止推流 =====");
     g_cloudStreamingActive = NO;
     stopWsHeartbeat();  // 停止心跳
+
+    // 清理原APP的 wsTask
+    Class mrClass = objc_getClass("MRCloudRelay");
+    id relay = ((id(*)(id, SEL))objc_msgSend)(mrClass, @selector(shared));
+    if (relay && [relay respondsToSelector:@selector(setWsTask:)]) {
+        ((void(*)(id, SEL, id))objc_msgSend)(relay, @selector(setWsTask:), nil);
+    }
 
     if (g_myWsTask) {
         [g_myWsTask cancel];
