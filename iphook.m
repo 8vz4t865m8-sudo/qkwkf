@@ -307,6 +307,7 @@ static void hook_tryAutoActivate(id self, SEL _cmd) {
 static NSURLSession *g_myWsSession = nil;
 static NSURLSessionWebSocketTask *g_myWsTask = nil;
 static dispatch_queue_t g_wsQueue = nil;
+static NSTimer *g_wsHeartbeatTimer = nil;  // WebSocket 心跳定时器
 
 typedef enum { WSStateDisconnected = 0, WSStateConnecting, WSStateConnected, WSStateFailed } WSState;
 static volatile WSState g_wsState = WSStateDisconnected;
@@ -377,6 +378,41 @@ static void wsSendFrameDirect(NSURLSessionWebSocketTask *task, NSData *data) {
     }];
 }
 
+static void wsSendHeartbeat() {
+    dispatch_async(g_wsQueue, ^{
+        if (g_wsState == WSStateConnected && g_myWsTask && g_myWsTask.state == NSURLSessionTaskStateRunning) {
+            // 发送一个空数据帧作为心跳，保持连接活跃
+            NSData *heartbeatData = [@"ping" dataUsingEncoding:NSUTF8StringEncoding];
+            NSURLSessionWebSocketMessage *msg = [[NSURLSessionWebSocketMessage alloc] initWithData:heartbeatData];
+            [g_myWsTask sendMessage:msg completionHandler:^(NSError *err) {
+                if (err) {
+                    NSLog(@"[Hook] 心跳发送失败: %@", err.localizedDescription);
+                    g_wsState = WSStateFailed;
+                    g_myWsTask = nil;
+                } else {
+                    NSLog(@"[Hook] 心跳发送成功");
+                }
+            }];
+        }
+    });
+}
+
+static void startWsHeartbeat() {
+    if (g_wsHeartbeatTimer) return;
+    g_wsHeartbeatTimer = [NSTimer scheduledTimerWithTimeInterval:30.0 repeats:YES block:^(NSTimer *timer) {
+        wsSendHeartbeat();
+    }];
+    NSLog(@"[Hook] WebSocket 心跳已启动（30秒间隔）");
+}
+
+static void stopWsHeartbeat() {
+    if (g_wsHeartbeatTimer) {
+        [g_wsHeartbeatTimer invalidate];
+        g_wsHeartbeatTimer = nil;
+        NSLog(@"[Hook] WebSocket 心跳已停止");
+    }
+}
+
 static void wsFlushRingBuffer() {
     if (!g_myWsTask || g_myWsTask.state != NSURLSessionTaskStateRunning) return;
 
@@ -392,6 +428,36 @@ static void wsFlushRingBuffer() {
     for (NSData *data in frames) {
         wsSendFrameDirect(g_myWsTask, data);
     }
+}
+
+static void wsStartReceiveLoop(NSURLSessionWebSocketTask *task) {
+    __weak NSURLSessionWebSocketTask *weakTask = task;
+    void (^receiveBlock)(void) = ^{
+        __strong NSURLSessionWebSocketTask *strongTask = weakTask;
+        if (!strongTask || strongTask.state != NSURLSessionTaskStateRunning) return;
+
+        [strongTask receiveMessageWithCompletionHandler:^(NSURLSessionWebSocketMessage *msg, NSError *err) {
+            if (err) {
+                dispatch_async(g_wsQueue, ^{
+                    if (g_myWsTask == strongTask) {
+                        g_wsState = WSStateFailed;
+                        g_myWsTask = nil;
+                    }
+                });
+                return;
+            }
+
+            if (msg.type == NSURLSessionWebSocketMessageTypeString) {
+                NSString *text = msg.string;
+                if ([text hasPrefix:@"cfg"]) {
+                    NSLog(@"[Hook] 收到配置: %@", text);
+                }
+            }
+
+            receiveBlock();
+        }];
+    };
+    receiveBlock();
 }
 
 static void wsConnect() {
@@ -431,6 +497,8 @@ static void wsConnect() {
                 NSLog(@"[Hook] WS 连接成功");
                 g_wsState = WSStateConnected;
                 g_myWsTask = task;
+                wsStartReceiveLoop(task);
+                startWsHeartbeat();  // 启动心跳保活
                 wsFlushRingBuffer();
             } else {
                 NSLog(@"[Hook] WS 连接失败，状态: %ld", (long)task.state);
@@ -480,6 +548,7 @@ static void hook_ensureRoomWithCompletion(id self, SEL _cmd, id completion) {
     setStringProp(self, @selector(setPublishWsUrl:), @"");
 
     g_cloudStreamingActive = NO;
+    stopWsHeartbeat();  // 确保心跳停止
     if (g_myWsTask) {
         [g_myWsTask cancel];
         g_myWsTask = nil;
@@ -563,6 +632,7 @@ static void hook_forwardPayload(id self, SEL _cmd, const void *payload, NSUInteg
 static void hook_closeRoomWithCompletion(id self, SEL _cmd, id completion) {
     NSLog(@"[Hook] ===== 用户点击停止推流 =====");
     g_cloudStreamingActive = NO;
+    stopWsHeartbeat();  // 停止心跳
 
     if (g_myWsTask) {
         [g_myWsTask cancel];
