@@ -1,6 +1,6 @@
 //
-//  MyRadarHook_v18.m - 修复心跳导致退出
-//  核心修复：heartbeatWithCompletion: 立即回调成功，Hook logout 阻止退出
+//  MyRadarHook_v14_heartbeatfix.m
+//  基于v14，修改心跳间隔为3600秒，重连次数为9999
 //
 
 #import <UIKit/UIKit.h>
@@ -23,7 +23,9 @@
 #define MY_HTTP_BASE       (@"http://" MY_SERVER_HOST @":" MY_SERVER_PORT)
 #define MY_WS_BASE         (MY_SERVER_SCHEME MY_SERVER_HOST @":" MY_SERVER_PORT)
 
-// ========== 工具 ==========
+// ============================================================
+// 工具函数
+// ============================================================
 static void hookMethod(const char *className, SEL sel, IMP newImp, IMP *oldImp) {
     Class cls = objc_getClass(className);
     if (!cls) { NSLog(@"[Hook] 找不到类: %s", className); return; }
@@ -122,7 +124,9 @@ static NSString *loadSavedMachineId() {
     return [[NSUserDefaults standardUserDefaults] objectForKey:@"udid"];
 }
 
-// ========== T3 验证 ==========
+// ============================================================
+// T3 验证系统
+// ============================================================
 static T3Verify *g_t3Verify = nil;
 static NSString *g_cardNo = nil;
 static NSString *g_statecode = nil;
@@ -165,7 +169,9 @@ static void stopT3Heartbeat() {
     }
 }
 
-// ========== 全局状态 ==========
+// ============================================================
+// 全局状态
+// ============================================================
 static BOOL g_cloudStreamingActive = NO;
 static NSString *g_fakeRoom = @"ROOM001";
 
@@ -176,7 +182,6 @@ static IMP orig_isActivated = NULL;
 static IMP orig_cardNo = NULL;
 static IMP orig_startHeartbeat = NULL;
 static IMP orig_stopHeartbeat = NULL;
-static IMP orig_logout = NULL;  // 新增
 
 // MRCloudRelay 原IMP
 static IMP orig_forwardPayload = NULL;
@@ -198,7 +203,31 @@ static IMP orig_startRadarServices = NULL;
 static IMP orig_activateRadarLink = NULL;
 static IMP orig_deactivateRadarLink = NULL;
 
-// ========== 验证 Hook ==========
+// ============================================================
+// 【新增】Hook 原APP心跳间隔和重连次数
+// ============================================================
+static IMP orig_setHeartbeatInterval = NULL;
+static IMP orig_setReconnectAttempt = NULL;
+
+static void hook_setHeartbeatInterval(id self, SEL _cmd, NSInteger interval) {
+    NSLog(@"[Hook] 拦截 setHeartbeatInterval: %ld -> 3600", (long)interval);
+    // 强制改为3600秒（1小时）
+    if (orig_setHeartbeatInterval) {
+        ((void(*)(id, SEL, NSInteger))orig_setHeartbeatInterval)(self, _cmd, 3600);
+    }
+}
+
+static void hook_setReconnectAttempt(id self, SEL _cmd, NSUInteger attempt) {
+    NSLog(@"[Hook] 拦截 setReconnectAttempt: %lu -> 9999", (unsigned long)attempt);
+    // 强制改为9999次
+    if (orig_setReconnectAttempt) {
+        ((void(*)(id, SEL, NSUInteger))orig_setReconnectAttempt)(self, _cmd, 9999);
+    }
+}
+
+// ============================================================
+// 验证 Hook
+// ============================================================
 static void hook_activateWithCardNo(id self, SEL _cmd, NSString *cardNo, NSString *machineId, id completion) {
     if (!cardNo.length) return;
     if (!g_t3InitSuccess) { initT3(); if (!g_t3InitSuccess) return; }
@@ -231,24 +260,11 @@ static void hook_activateWithCardNo(id self, SEL _cmd, NSString *cardNo, NSStrin
     });
 }
 
-// 【关键修复】heartbeatWithCompletion: 立即回调成功，不让原APP走失败逻辑
 static void hook_heartbeatWithCompletion(id self, SEL _cmd, id completion) {
-    NSLog(@"[Hook] 拦截原心跳，立即返回成功");
-    // 后台发T3心跳（不等待结果）
-    if (g_t3Verified && g_cardNo && g_statecode) {
-        dispatch_async(dispatch_get_global_queue(0,0), ^{
-            T3Result *r = [g_t3Verify heartbeatWithKami:g_cardNo statecode:g_statecode];
-            if (!r.success) { g_t3Verified = NO; NSLog(@"[Hook] T3心跳失败"); }
-        });
-    }
-    // 关键：立即告诉原APP心跳成功，阻止它调用logout或exit
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (completion) {
-            @try {
-                void (^block)(BOOL, NSError *) = completion;
-                block(YES, nil);
-            } @catch (NSException *e) {}
-        }
+    if (!g_t3Verified) return;
+    dispatch_async(dispatch_get_global_queue(0,0), ^{
+        T3Result *r = [g_t3Verify heartbeatWithKami:g_cardNo statecode:g_statecode];
+        if (!r.success) g_t3Verified = NO;
     });
 }
 
@@ -262,12 +278,6 @@ static void hook_startHeartbeat(id self, SEL _cmd) {
 static void hook_stopHeartbeat(id self, SEL _cmd) {
     NSLog(@"[Hook] 拦截原APP stopHeartbeat");
     stopT3Heartbeat();
-}
-
-// 【关键修复】拦截 logout，阻止清理数据和退出
-static void hook_logout(id self, SEL _cmd) {
-    NSLog(@"[Hook] 拦截 logout，阻止退出");
-    // 什么都不做
 }
 
 static void hook_tryAutoActivate(id self, SEL _cmd) {
@@ -310,7 +320,9 @@ static void hook_tryAutoActivate(id self, SEL _cmd) {
     }
 }
 
-// ========== WebSocket 引擎 ==========
+// ============================================================
+// WebSocket 引擎
+// ============================================================
 static NSURLSession *g_myWsSession = nil;
 static NSURLSessionWebSocketTask *g_myWsTask = nil;
 static dispatch_queue_t g_wsQueue = nil;
@@ -412,7 +424,7 @@ static void startWsHeartbeat() {
             wsSendHeartbeat();
         });
         dispatch_resume(g_wsHeartbeatTimer);
-        NSLog(@"[Hook] WebSocket 心跳已启动（30秒间隔，dispatch_source）");
+        NSLog(@"[Hook] WebSocket 心跳已启动（30秒间隔）");
     }
 }
 
@@ -542,68 +554,10 @@ static void wsSendOrEnqueue(NSData *data) {
     });
 }
 
-// ========== 299秒刷新 ==========
-static dispatch_source_t g_refreshTimer = NULL;
+// ============================================================
+// MRCloudRelay Hook
+// ============================================================
 
-static void refreshTimerStart();
-static void refreshTimerStop();
-
-static void doRefreshState() {
-    if (!g_cloudStreamingActive) {
-        NSLog(@"[Hook] 299秒刷新：云端已关闭，跳过");
-        return;
-    }
-    NSLog(@"[Hook] ===== 299秒刷新触发 =====");
-    
-    Class mrClass = objc_getClass("MRCloudRelay");
-    id relay = ((id(*)(id, SEL))objc_msgSend)(mrClass, @selector(shared));
-    if (!relay) {
-        NSLog(@"[Hook] 刷新失败：找不到 MRCloudRelay");
-        refreshTimerStart();
-        return;
-    }
-    
-    setBoolProp(relay, @selector(setWsConnected:), YES);
-    setBoolProp(relay, @selector(setWsConnecting:), NO);
-    if ([relay respondsToSelector:@selector(setReconnectAttempt:)]) {
-        ((void(*)(id, SEL, NSInteger))objc_msgSend)(relay, @selector(setReconnectAttempt:), 0);
-    }
-    
-    if (g_wsState != WSStateConnected) {
-        NSLog(@"[Hook] 刷新时检测到WS断开，自动重连");
-        wsConnect();
-    }
-    
-    NSLog(@"[Hook] 状态刷新完成，启动下一次299秒");
-    refreshTimerStart();
-}
-
-static void refreshTimerStart() {
-    if (g_refreshTimer) {
-        dispatch_source_cancel(g_refreshTimer);
-        g_refreshTimer = nil;
-    }
-    dispatch_queue_t q = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
-    g_refreshTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
-    dispatch_source_set_timer(g_refreshTimer, 
-                              dispatch_time(DISPATCH_TIME_NOW, 299 * NSEC_PER_SEC),
-                              DISPATCH_TIME_FOREVER,
-                              5 * NSEC_PER_SEC);
-    dispatch_source_set_event_handler(g_refreshTimer, ^{
-        doRefreshState();
-    });
-    dispatch_resume(g_refreshTimer);
-}
-
-static void refreshTimerStop() {
-    if (g_refreshTimer) {
-        dispatch_source_cancel(g_refreshTimer);
-        g_refreshTimer = nil;
-        NSLog(@"[Hook] 299秒刷新定时器已停止");
-    }
-}
-
-// ========== MRCloudRelay Hook ==========
 static void hook_ensureRoomWithCompletion(id self, SEL _cmd, id completion) {
     NSLog(@"[Hook] ensureRoom - 返回未分享状态");
     setBoolProp(self, @selector(setCreating:), NO);
@@ -617,7 +571,6 @@ static void hook_ensureRoomWithCompletion(id self, SEL _cmd, id completion) {
     setStringProp(self, @selector(setPublishWsUrl:), @"");
     g_cloudStreamingActive = NO;
     stopWsHeartbeat();
-    refreshTimerStop();
     Class mrClass = objc_getClass("MRCloudRelay");
     id relay = ((id(*)(id, SEL))objc_msgSend)(mrClass, @selector(shared));
     if (relay && [relay respondsToSelector:@selector(setWsTask:)]) {
@@ -665,7 +618,6 @@ static void hook_openSharingWithCompletion(id self, SEL _cmd, id completion) {
             showSuccess(@"云端推流已开启");
         });
         safeCallCompletion(completion, g_fakeRoom);
-        refreshTimerStart();
     } @catch (NSException *e) {
         NSLog(@"[Hook] openSharing 异常: %@", e);
         safeCallCompletion(completion, g_fakeRoom);
@@ -698,7 +650,6 @@ static void hook_closeRoomWithCompletion(id self, SEL _cmd, id completion) {
     NSLog(@"[Hook] ===== 用户点击停止推流 =====");
     g_cloudStreamingActive = NO;
     stopWsHeartbeat();
-    refreshTimerStop();
     Class mrClass = objc_getClass("MRCloudRelay");
     id relay = ((id(*)(id, SEL))objc_msgSend)(mrClass, @selector(shared));
     if (relay && [relay respondsToSelector:@selector(setWsTask:)]) {
@@ -770,7 +721,9 @@ static void hook_mr_fetchDirectWatchUrl(id self, SEL _cmd) {
     }
 }
 
-// ========== MBWebSocketServer Hook ==========
+// ============================================================
+// MBWebSocketServer Hook
+// ============================================================
 static void hook_mbSend(id self, SEL _cmd, id data) {
     if (g_cloudStreamingActive) {
         return;
@@ -789,7 +742,9 @@ static void hook_mbSendRawBytes(id self, SEL _cmd, const void *bytes, NSUInteger
     }
 }
 
-// ========== ViewController Hook ==========
+// ============================================================
+// ViewController Hook
+// ============================================================
 static void hook_startHttp(id self, SEL _cmd) {
     if (g_cloudStreamingActive) {
         NSLog(@"[Hook] 云端模式，跳过本地HTTP服务创建");
@@ -885,9 +840,13 @@ static void hook_refreshCloudPanel(id self, SEL _cmd) {
     } @catch (NSException *e) {}
 }
 
-// ========== 初始化 ==========
+// ============================================================
+// 初始化
+// ============================================================
 static void initHooks() {
-    NSLog(@"[Hook] 开始初始化 v18...");
+    NSLog(@"[Hook] 开始初始化 v14_heartbeatfix...");
+
+    // 验证系统
     hookMethod(OLD_VERIFY_CLASS, @selector(activateWithCardNo:machineId:completion:),
                (IMP)hook_activateWithCardNo, &orig_activateWithCardNo);
     hookMethod(OLD_VERIFY_CLASS, @selector(heartbeatWithCompletion:),
@@ -900,13 +859,20 @@ static void initHooks() {
                (IMP)hook_startHeartbeat, &orig_startHeartbeat);
     hookMethod(OLD_VERIFY_CLASS, @selector(stopHeartbeat),
                (IMP)hook_stopHeartbeat, &orig_stopHeartbeat);
-    hookMethod(OLD_VERIFY_CLASS, @selector(logout),  // 新增：拦截logout
-               (IMP)hook_logout, &orig_logout);
-    
+
+    // 【新增】Hook 心跳间隔和重连次数
+    hookMethod(OLD_VERIFY_CLASS, @selector(setHeartbeatInterval:),
+               (IMP)hook_setHeartbeatInterval, &orig_setHeartbeatInterval);
+    hookMethod("MRCloudRelay", @selector(setReconnectAttempt:),
+               (IMP)hook_setReconnectAttempt, &orig_setReconnectAttempt);
+
+    // 自动登录
     hookMethod("ViewController", @selector(tryAutoActivate),
                (IMP)hook_tryAutoActivate, NULL);
+
     initT3();
-    
+
+    // MRCloudRelay
     const char *mrClass = "MRCloudRelay";
     hookMethod(mrClass, @selector(ensureRoomWithCompletion:), 
                (IMP)hook_ensureRoomWithCompletion, NULL);
@@ -938,13 +904,15 @@ static void initHooks() {
                (IMP)hook_mr_scheduleReconnect, NULL);
     hookMethod(mrClass, @selector(mr_fetchDirectWatchUrl), 
                (IMP)hook_mr_fetchDirectWatchUrl, &orig_mr_fetchDirectWatchUrl);
-    
+
+    // MBWebSocketServer
     const char *mbClass = "MBWebSocketServer";
     hookMethod(mbClass, @selector(send:), 
                (IMP)hook_mbSend, &orig_mbSend);
     hookMethod(mbClass, @selector(sendRawBytes:length:), 
                (IMP)hook_mbSendRawBytes, &orig_mbSendRawBytes);
-    
+
+    // ViewController
     const char *vcClass = "ViewController";
     hookMethod(vcClass, @selector(startHttp), 
                (IMP)hook_startHttp, &orig_startHttp);
@@ -966,21 +934,18 @@ static void initHooks() {
                (IMP)hook_currentStreamWatchUrl, NULL);
     hookMethod(vcClass, @selector(refreshCloudPanel), 
                (IMP)hook_refreshCloudPanel, NULL);
-    
-    NSLog(@"[Hook] v18 初始化完成");
-    NSLog(@"[Hook] 核心修复: heartbeatWithCompletion 立即返回成功");
-    NSLog(@"[Hook] 核心修复: 拦截 logout 阻止退出");
-    NSLog(@"[Hook] 299秒刷新: 循环重置原APP状态机");
+
+    NSLog(@"[Hook] 全部初始化完成 v14_heartbeatfix");
+    NSLog(@"[Hook] 心跳间隔: 3600秒");
+    NSLog(@"[Hook] 重连次数: 9999次");
 }
 
 __attribute__((constructor))
 static void hook_init() {
     NSLog(@"========================================");
-    NSLog(@"[Hook] T3卡密+云端推流 v18 已加载");
+    NSLog(@"[Hook] T3卡密+云端推流 v14_heartbeatfix 已加载");
     NSLog(@"[Hook] 服务器: %@", MY_HTTP_BASE);
-    NSLog(@"[Hook] 修复: heartbeatWithCompletion 立即返回成功");
-    NSLog(@"[Hook] 修复: 拦截 logout 阻止退出");
-    NSLog(@"[Hook] 299秒刷新: 防止300秒断推流");
+    NSLog(@"[Hook] 修复: 心跳间隔3600秒，重连次数9999");
     NSLog(@"========================================");
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.3*NSEC_PER_SEC), dispatch_get_main_queue(), ^{
         initHooks();
