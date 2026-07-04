@@ -315,62 +315,56 @@ static void hook_tryAutoActivate(id self, SEL _cmd) {
 // WebSocket 引擎 - 零掉帧版（环形缓冲区）
 // ============================================================
 
-// 环形缓冲区结构
-typedef struct {
-    NSData **buffer;
-    NSUInteger capacity;
-    NSUInteger head;
-    NSUInteger tail;
-    NSUInteger count;
-    dispatch_semaphore_t sem;
-} RingBuffer;
-
-static RingBuffer g_ringBuffer = {0};
+// 环形缓冲区 - 使用 NSMutableArray（ARC兼容）
+static NSMutableArray<NSData*> *g_ringBuffer = nil;
+static NSUInteger g_ringCapacity = 300;
+static NSUInteger g_ringHead = 0;
+static NSUInteger g_ringTail = 0;
+static dispatch_semaphore_t g_ringSem = NULL;
 static dispatch_queue_t g_senderQueue = NULL;
 static volatile BOOL g_senderRunning = NO;
 
 static void ringBufferInit(NSUInteger capacity) {
-    g_ringBuffer.buffer = calloc(capacity, sizeof(NSData*));
-    g_ringBuffer.capacity = capacity;
-    g_ringBuffer.head = 0;
-    g_ringBuffer.tail = 0;
-    g_ringBuffer.count = 0;
-    g_ringBuffer.sem = dispatch_semaphore_create(0);
+    g_ringCapacity = capacity;
+    g_ringBuffer = [NSMutableArray arrayWithCapacity:capacity];
+    for (NSUInteger i = 0; i < capacity; i++) {
+        [g_ringBuffer addObject:[NSData data]]; // 占位
+    }
+    g_ringHead = 0;
+    g_ringTail = 0;
+    g_ringSem = dispatch_semaphore_create(0);
 }
 
 static void ringBufferPush(NSData *data) {
-    if (!data) return;
-    NSUInteger next = (g_ringBuffer.head + 1) % g_ringBuffer.capacity;
-    if (next == g_ringBuffer.tail) {
-        // 缓冲区满：覆盖最旧的帧（丢旧帧，不丢新帧）
-        NSLog(@"[Hook] 环形缓冲区满，覆盖旧帧");
-        g_ringBuffer.tail = (g_ringBuffer.tail + 1) % g_ringBuffer.capacity;
+    if (!data || !g_ringBuffer) return;
+    NSUInteger next = (g_ringHead + 1) % g_ringCapacity;
+    if (next == g_ringTail) {
+        // 缓冲区满：覆盖最旧的帧
+        g_ringTail = (g_ringTail + 1) % g_ringCapacity;
     }
-    g_ringBuffer.buffer[g_ringBuffer.head] = data;
-    g_ringBuffer.head = next;
-    g_ringBuffer.count++;
-    dispatch_semaphore_signal(g_ringBuffer.sem);
+    g_ringBuffer[g_ringHead] = data;
+    g_ringHead = next;
+    dispatch_semaphore_signal(g_ringSem);
 }
 
 static NSData *ringBufferPop() {
-    if (g_ringBuffer.head == g_ringBuffer.tail) {
-        // 空缓冲区，等待
-        dispatch_semaphore_wait(g_ringBuffer.sem, DISPATCH_TIME_FOREVER);
-        if (g_ringBuffer.head == g_ringBuffer.tail) return nil;
+    if (!g_ringBuffer) return nil;
+    if (g_ringHead == g_ringTail) {
+        dispatch_semaphore_wait(g_ringSem, DISPATCH_TIME_FOREVER);
+        if (g_ringHead == g_ringTail) return nil;
     }
-    NSData *data = g_ringBuffer.buffer[g_ringBuffer.tail];
-    g_ringBuffer.buffer[g_ringBuffer.tail] = NULL;
-    g_ringBuffer.tail = (g_ringBuffer.tail + 1) % g_ringBuffer.capacity;
-    g_ringBuffer.count--;
+    NSData *data = g_ringBuffer[g_ringTail];
+    g_ringBuffer[g_ringTail] = [NSData data]; // 清空引用
+    g_ringTail = (g_ringTail + 1) % g_ringCapacity;
     return data;
 }
 
 static void ringBufferClear() {
-    while (g_ringBuffer.head != g_ringBuffer.tail) {
-        g_ringBuffer.buffer[g_ringBuffer.tail] = nil;
-        g_ringBuffer.tail = (g_ringBuffer.tail + 1) % g_ringBuffer.capacity;
+    if (!g_ringBuffer) return;
+    while (g_ringHead != g_ringTail) {
+        g_ringBuffer[g_ringTail] = [NSData data];
+        g_ringTail = (g_ringTail + 1) % g_ringCapacity;
     }
-    g_ringBuffer.count = 0;
 }
 
 // WebSocket 状态
@@ -468,7 +462,7 @@ static void senderThreadLoop() {
 static void startSenderThread() {
     if (g_senderRunning) return;
     g_senderRunning = YES;
-    if (!g_ringBuffer.buffer) {
+    if (!g_ringBuffer) {
         ringBufferInit(300); // 300帧缓冲区，约5-10秒数据
     }
     if (!g_senderQueue) {
@@ -486,7 +480,7 @@ static void startSenderThread() {
 static void stopSenderThread() {
     g_senderRunning = NO;
     // 唤醒发送线程让它退出
-    dispatch_semaphore_signal(g_ringBuffer.sem);
+    dispatch_semaphore_signal(g_ringSem);
     ringBufferClear();
 
     dispatch_async(g_wsQueue, ^{
