@@ -1,6 +1,6 @@
 //
-//  MyRadarHook_v17.m - 终极精简版
-//  只做5件事：T3验证、云端推流、299秒刷新、零掉帧、自动保存
+//  MyRadarHook_v17_fix.m - 修复闪退版
+//  修复：删除自动跳转，修复T3心跳，加强错误保护
 //
 
 #import <UIKit/UIKit.h>
@@ -21,17 +21,18 @@
 #define MY_HTTP_BASE       (@"http://" MY_SERVER_HOST @":" MY_SERVER_PORT)
 #define MY_WS_BASE         (MY_SERVER_SCHEME MY_SERVER_HOST @":" MY_SERVER_PORT)
 
-// ========== 全局状态（放最前面）==========
+// ========== 全局状态 ==========
 static BOOL g_cloud = NO;
 
 // ========== 工具 ==========
 static void hookMethod(const char *cn, SEL sel, IMP newImp, IMP *oldImp) {
     Class cls = objc_getClass(cn);
-    if (!cls) return;
+    if (!cls) { NSLog(@"[Hook] 类不存在: %s", cn); return; }
     Method m = class_getInstanceMethod(cls, sel);
-    if (!m) return;
+    if (!m) { NSLog(@"[Hook] 方法不存在: %s", sel_getName(sel)); return; }
     if (oldImp) *oldImp = method_getImplementation(m);
     method_setImplementation(m, newImp);
+    NSLog(@"[Hook] OK: %s", sel_getName(sel));
 }
 
 static void setString(id self, SEL sel, NSString *v) {
@@ -55,13 +56,50 @@ static T3Verify *g_t3 = nil;
 static NSString *g_card = nil;
 static NSString *g_state = nil;
 static BOOL g_ok = NO;
+static NSTimer *g_t3Timer = nil;
 
 static void initT3() {
     if (g_t3) return;
     g_t3 = [[T3Verify alloc] init];
+    NSError *err = nil;
     g_ok = [g_t3 initRsaWithLoginCode:T3_LOGIN_CODE noticeCode:T3_NOTICE_CODE
                           versionCode:T3_VERSION_CODE heartbeatCode:T3_HEARTBEAT_CODE
-                               appkey:T3_APPKEY rsaPublicKey:T3_RSA_PUBLIC_KEY error:nil];
+                               appkey:T3_APPKEY rsaPublicKey:T3_RSA_PUBLIC_KEY error:&err];
+    if (g_ok) NSLog(@"[Hook] T3初始化成功");
+    else NSLog(@"[Hook] T3初始化失败: %@", err);
+}
+
+static void doT3Heartbeat() {
+    if (!g_ok || !g_card || !g_state) return;
+    dispatch_async(dispatch_get_global_queue(0,0), ^{
+        @try {
+            T3Result *r = [g_t3 heartbeatWithKami:g_card statecode:g_state];
+            if (!r.success) { g_ok = NO; NSLog(@"[Hook] T3心跳失败"); }
+        } @catch (NSException *e) {
+            NSLog(@"[Hook] T3心跳异常: %@", e);
+        }
+    });
+}
+
+static void startT3Heartbeat() {
+    if (g_t3Timer) return;
+    // 在主线程创建timer，避免后台线程问题
+    dispatch_async(dispatch_get_main_queue(), ^{
+        g_t3Timer = [NSTimer scheduledTimerWithTimeInterval:30.0 repeats:YES block:^(NSTimer *t) {
+            doT3Heartbeat();
+        }];
+        // 立即执行一次
+        doT3Heartbeat();
+    });
+}
+
+static void stopT3Heartbeat() {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (g_t3Timer) {
+            [g_t3Timer invalidate];
+            g_t3Timer = nil;
+        }
+    });
 }
 
 static void saveCard(NSString *card, NSString *mid) {
@@ -81,7 +119,7 @@ static NSURLSessionWebSocketTask *g_task = nil;
 static dispatch_queue_t g_q = nil;
 static dispatch_source_t g_hb = nil;
 static NSMutableArray<NSData*> *g_buf = nil;
-static NSUInteger g_h = 0, g_t = 0;
+static NSUInteger g_h = 0, g_ta = 0;
 static const NSUInteger MAX_BUF = 300;
 static volatile int g_ws = 0;
 
@@ -90,23 +128,23 @@ static void wsConnect();
 static void bufInit() {
     g_buf = [NSMutableArray arrayWithCapacity:MAX_BUF];
     for (NSUInteger i = 0; i < MAX_BUF; i++) [g_buf addObject:[NSData data]];
-    g_h = g_t = 0;
+    g_h = g_ta = 0;
 }
 
 static void bufPush(NSData *d) {
     if (!d || !g_buf) return;
     NSUInteger n = (g_h + 1) % MAX_BUF;
-    if (n == g_t) g_t = (g_t + 1) % MAX_BUF;
+    if (n == g_ta) g_ta = (g_ta + 1) % MAX_BUF;
     g_buf[g_h] = d;
     g_h = n;
 }
 
 static void bufFlush() {
     if (!g_task || g_task.state != NSURLSessionTaskStateRunning) return;
-    while (g_h != g_t) {
-        NSData *d = g_buf[g_t];
-        g_buf[g_t] = [NSData data];
-        g_t = (g_t + 1) % MAX_BUF;
+    while (g_h != g_ta) {
+        NSData *d = g_buf[g_ta];
+        g_buf[g_ta] = [NSData data];
+        g_ta = (g_ta + 1) % MAX_BUF;
         if (d.length > 0) {
             NSURLSessionWebSocketMessage *m = [[NSURLSessionWebSocketMessage alloc] initWithData:d];
             [g_task sendMessage:m completionHandler:^(NSError * _Nullable error) {}];
@@ -203,7 +241,7 @@ static void refreshTimerStart();
 
 static void doRefresh() {
     if (!g_cloud) return;
-    NSLog(@"[Hook] 299秒刷新触发");
+    NSLog(@"[Hook] 299秒刷新");
 
     Class cls = objc_getClass(@"MRCloudRelay");
     id relay = ((id(*)(id, SEL))objc_msgSend)(cls, @selector(shared));
@@ -238,34 +276,48 @@ static IMP orig_act = NULL;
 static void hk_act(id self, SEL _cmd, NSString *card, NSString *mid, id completion) {
     if (!card.length) return;
     initT3();
+    if (!g_ok) {
+        NSLog(@"[Hook] T3未初始化，无法验证");
+        if (completion) { void(^b)(NSString*,NSError*) = completion; b(nil, nil); }
+        return;
+    }
     g_card = card;
     NSString *imei = mid.length ? mid : [T3Verify getMachineCode];
     dispatch_async(dispatch_get_global_queue(0,0), ^{
-        T3LoginResult *r = [g_t3 loginWithKami:card imei:imei];
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (r.success) {
-                g_ok = YES; g_state = r.statecode;
-                saveCard(card, imei);
-                setBool(self, @selector(setIsActivated:), YES);
-                setString(self, @selector(setCardNo:), card);
-                UIViewController *vc = [UIApplication sharedApplication].keyWindow.rootViewController;
-                if ([vc isKindOfClass:[UINavigationController class]]) vc = [(UINavigationController*)vc topViewController];
-                while (vc.presentedViewController) vc = vc.presentedViewController;
-                if ([vc respondsToSelector:@selector(enterMainConsole)]) {
-                    ((void(*)(id, SEL))objc_msgSend)(vc, @selector(enterMainConsole));
+        @try {
+            T3LoginResult *r = [g_t3 loginWithKami:card imei:imei];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                @try {
+                    if (r.success) {
+                        g_ok = YES; g_state = r.statecode;
+                        saveCard(card, imei);
+                        setBool(self, @selector(setIsActivated:), YES);
+                        setString(self, @selector(setCardNo:), card);
+                        startT3Heartbeat();
+                        NSLog(@"[Hook] 验证成功: %@", card);
+                    } else {
+                        g_ok = NO;
+                        NSLog(@"[Hook] 验证失败: %@", r.error);
+                    }
+                    if (completion) { void(^b)(NSString*,NSError*) = completion; b(r.success ? card : nil, nil); }
+                } @catch (NSException *e) {
+                    NSLog(@"[Hook] 验证回调异常: %@", e);
+                    if (completion) { void(^b)(NSString*,NSError*) = completion; b(nil, nil); }
                 }
-            } else {
-                g_ok = NO;
-            }
-            if (completion) { void(^b)(NSString*,NSError*) = completion; b(r.success ? card : nil, nil); }
-        });
+            });
+        } @catch (NSException *e) {
+            NSLog(@"[Hook] 验证异常: %@", e);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (completion) { void(^b)(NSString*,NSError*) = completion; b(nil, nil); }
+            });
+        }
     });
 }
 
 static BOOL hk_isAct(id self, SEL _cmd) { return g_ok; }
 static id hk_card(id self, SEL _cmd) { return g_card ?: @""; }
-static void hk_startHb(id self, SEL _cmd) {}
-static void hk_stopHb(id self, SEL _cmd) {}
+static void hk_startHb(id self, SEL _cmd) { NSLog(@"[Hook] 拦截原心跳"); }
+static void hk_stopHb(id self, SEL _cmd) { stopT3Heartbeat(); }
 
 // 2. 推流
 static IMP orig_fp = NULL;
@@ -415,11 +467,11 @@ static void initHooks() {
     hookMethod("ViewController", @selector(startStreamingWithHardcodedServer), (IMP)hk_startStream, NULL);
     hookMethod("ViewController", @selector(currentStreamWatchUrl), (IMP)hk_curl, NULL);
 
-    NSLog(@"[Hook] v17 初始化完成");
+    NSLog(@"[Hook] v17_fix 初始化完成");
 }
 
 __attribute__((constructor))
 static void hook_init() {
-    NSLog(@"[Hook] v17 加载 | %@", MY_HTTP_BASE);
+    NSLog(@"[Hook] v17_fix 加载 | %@", MY_HTTP_BASE);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.3*NSEC_PER_SEC), dispatch_get_main_queue(), ^{ initHooks(); });
 }
