@@ -364,6 +364,36 @@ static void wsFlushPendingQueue() {
     }
 }
 
+static void wsStartReceiveLoop(NSURLSessionWebSocketTask *task) {
+    __weak NSURLSessionWebSocketTask *weakTask = task;
+    void (^receiveBlock)(void) = ^{
+        __strong NSURLSessionWebSocketTask *strongTask = weakTask;
+        if (!strongTask || strongTask.state != NSURLSessionTaskStateRunning) return;
+
+        [strongTask receiveMessageWithCompletionHandler:^(NSURLSessionWebSocketMessage *msg, NSError *err) {
+            if (err) {
+                dispatch_async(g_wsQueue, ^{
+                    if (g_myWsTask == strongTask) {
+                        g_wsState = WSStateFailed;
+                        g_myWsTask = nil;
+                    }
+                });
+                return;
+            }
+
+            if (msg.type == NSURLSessionWebSocketMessageTypeString) {
+                NSString *text = msg.string;
+                if ([text hasPrefix:@"cfg"]) {
+                    NSLog(@"[Hook] 收到配置: %@", text);
+                }
+            }
+
+            receiveBlock();
+        }];
+    };
+    receiveBlock();
+}
+
 static void wsConnect() {
     dispatch_async(g_wsQueue, ^{
         if (g_wsState == WSStateConnected && g_myWsTask && g_myWsTask.state == NSURLSessionTaskStateRunning) return;
@@ -410,35 +440,7 @@ static void wsConnect() {
     });
 }
 
-static void wsStartReceiveLoop(NSURLSessionWebSocketTask *task) {
-    __weak NSURLSessionWebSocketTask *weakTask = task;
-    void (^receiveBlock)(void) = ^{
-        __strong NSURLSessionWebSocketTask *strongTask = weakTask;
-        if (!strongTask || strongTask.state != NSURLSessionTaskStateRunning) return;
 
-        [strongTask receiveMessageWithCompletionHandler:^(NSURLSessionWebSocketMessage *msg, NSError *err) {
-            if (err) {
-                dispatch_async(g_wsQueue, ^{
-                    if (g_myWsTask == strongTask) {
-                        g_wsState = WSStateFailed;
-                        g_myWsTask = nil;
-                    }
-                });
-                return;
-            }
-
-            if (msg.type == NSURLSessionWebSocketMessageTypeString) {
-                NSString *text = msg.string;
-                if ([text hasPrefix:@"cfg"]) {
-                    NSLog(@"[Hook] 收到配置: %@", text);
-                }
-            }
-
-            receiveBlock();
-        }];
-    };
-    receiveBlock();
-}
 
 // 优化版：已连接直接发，未连接只留最新1帧
 static void wsSendOrEnqueueOptimized(NSData *data) {
