@@ -307,7 +307,7 @@ static void hook_tryAutoActivate(id self, SEL _cmd) {
 static NSURLSession *g_myWsSession = nil;
 static NSURLSessionWebSocketTask *g_myWsTask = nil;
 static dispatch_queue_t g_wsQueue = nil;
-static NSTimer *g_wsHeartbeatTimer = nil;  // WebSocket 心跳定时器
+static dispatch_source_t g_wsHeartbeatTimer = nil;  // WebSocket 心跳定时器（dispatch_source，不受runloop影响）
 
 typedef enum { WSStateDisconnected = 0, WSStateConnecting, WSStateConnected, WSStateFailed } WSState;
 static volatile WSState g_wsState = WSStateDisconnected;
@@ -381,16 +381,14 @@ static void wsSendFrameDirect(NSURLSessionWebSocketTask *task, NSData *data) {
 static void wsSendHeartbeat() {
     dispatch_async(g_wsQueue, ^{
         if (g_wsState == WSStateConnected && g_myWsTask && g_myWsTask.state == NSURLSessionTaskStateRunning) {
-            // 发送一个空数据帧作为心跳，保持连接活跃
-            NSData *heartbeatData = [@"ping" dataUsingEncoding:NSUTF8StringEncoding];
-            NSURLSessionWebSocketMessage *msg = [[NSURLSessionWebSocketMessage alloc] initWithData:heartbeatData];
-            [g_myWsTask sendMessage:msg completionHandler:^(NSError *err) {
+            // 使用 WebSocket 原生 ping 方法（协议级别，服务器一定能识别）
+            [g_myWsTask sendPingWithPongReceiveHandler:^(NSError *err) {
                 if (err) {
                     NSLog(@"[Hook] 心跳发送失败: %@", err.localizedDescription);
                     g_wsState = WSStateFailed;
                     g_myWsTask = nil;
                 } else {
-                    NSLog(@"[Hook] 心跳发送成功");
+                    NSLog(@"[Hook] WebSocket ping 发送成功");
                 }
             }];
         }
@@ -399,15 +397,25 @@ static void wsSendHeartbeat() {
 
 static void startWsHeartbeat() {
     if (g_wsHeartbeatTimer) return;
-    g_wsHeartbeatTimer = [NSTimer scheduledTimerWithTimeInterval:30.0 repeats:YES block:^(NSTimer *timer) {
-        wsSendHeartbeat();
-    }];
-    NSLog(@"[Hook] WebSocket 心跳已启动（30秒间隔）");
+
+    // 使用 dispatch_source 创建定时器，不受 runloop 影响，后台也能触发
+    g_wsHeartbeatTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, g_wsQueue);
+    if (g_wsHeartbeatTimer) {
+        dispatch_source_set_timer(g_wsHeartbeatTimer, 
+                                  dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC),
+                                  30 * NSEC_PER_SEC,  // 30秒间隔
+                                  5 * NSEC_PER_SEC);   // 5秒容差
+        dispatch_source_set_event_handler(g_wsHeartbeatTimer, ^{
+            wsSendHeartbeat();
+        });
+        dispatch_resume(g_wsHeartbeatTimer);
+        NSLog(@"[Hook] WebSocket 心跳已启动（30秒间隔，dispatch_source）");
+    }
 }
 
 static void stopWsHeartbeat() {
     if (g_wsHeartbeatTimer) {
-        [g_wsHeartbeatTimer invalidate];
+        dispatch_source_cancel(g_wsHeartbeatTimer);
         g_wsHeartbeatTimer = nil;
         NSLog(@"[Hook] WebSocket 心跳已停止");
     }
