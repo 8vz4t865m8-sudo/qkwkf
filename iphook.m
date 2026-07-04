@@ -21,6 +21,9 @@
 #define MY_HTTP_BASE       (@"http://" MY_SERVER_HOST @":" MY_SERVER_PORT)
 #define MY_WS_BASE         (MY_SERVER_SCHEME MY_SERVER_HOST @":" MY_SERVER_PORT)
 
+// ========== 全局状态（放最前面）==========
+static BOOL g_cloud = NO;
+
 // ========== 工具 ==========
 static void hookMethod(const char *cn, SEL sel, IMP newImp, IMP *oldImp) {
     Class cls = objc_getClass(cn);
@@ -41,6 +44,10 @@ static void setBool(id self, SEL sel, BOOL v) {
 
 static void setInt(id self, SEL sel, NSInteger v) {
     if ([self respondsToSelector:sel]) ((void(*)(id, SEL, NSInteger))objc_msgSend)(self, sel, v);
+}
+
+static void setObject(id self, SEL sel, id v) {
+    if ([self respondsToSelector:sel]) ((void(*)(id, SEL, id))objc_msgSend)(self, sel, v);
 }
 
 // ========== T3验证 ==========
@@ -76,7 +83,9 @@ static dispatch_source_t g_hb = nil;
 static NSMutableArray<NSData*> *g_buf = nil;
 static NSUInteger g_h = 0, g_t = 0;
 static const NSUInteger MAX_BUF = 300;
-static volatile int g_ws = 0; // 0=断 1=连 2=好
+static volatile int g_ws = 0;
+
+static void wsConnect();
 
 static void bufInit() {
     g_buf = [NSMutableArray arrayWithCapacity:MAX_BUF];
@@ -87,7 +96,7 @@ static void bufInit() {
 static void bufPush(NSData *d) {
     if (!d || !g_buf) return;
     NSUInteger n = (g_h + 1) % MAX_BUF;
-    if (n == g_t) g_t = (g_t + 1) % MAX_BUF; // 覆盖最旧
+    if (n == g_t) g_t = (g_t + 1) % MAX_BUF;
     g_buf[g_h] = d;
     g_h = n;
 }
@@ -100,20 +109,19 @@ static void bufFlush() {
         g_t = (g_t + 1) % MAX_BUF;
         if (d.length > 0) {
             NSURLSessionWebSocketMessage *m = [[NSURLSessionWebSocketMessage alloc] initWithData:d];
-            [g_task sendMessage:m completionHandler:nil];
+            [g_task sendMessage:m completionHandler:^(NSError * _Nullable error) {}];
         }
     }
 }
 
-static void wsConnect();
 static void wsHb() {
     dispatch_async(g_q, ^{
         if (g_ws == 2 && g_task && g_task.state == NSURLSessionTaskStateRunning) {
             NSData *ping = [@"{\"t\":\"hb\"}" dataUsingEncoding:NSUTF8StringEncoding];
             NSURLSessionWebSocketMessage *m = [[NSURLSessionWebSocketMessage alloc] initWithData:ping];
-            [g_task sendMessage:m completionHandler:nil];
-            [g_task sendPingWithPongReceiveHandler:^(NSError *e) {
-                if (e) { g_ws = 3; g_task = nil; wsConnect(); }
+            [g_task sendMessage:m completionHandler:^(NSError * _Nullable error) {}];
+            [g_task sendPingWithPongReceiveHandler:^(NSError * _Nullable error) {
+                if (error) { g_ws = 3; g_task = nil; wsConnect(); }
             }];
         } else if (g_ws == 0 || g_ws == 3) {
             wsConnect();
@@ -122,7 +130,7 @@ static void wsHb() {
 }
 
 static void wsRecv(NSURLSessionWebSocketTask *task) {
-    [task receiveMessageWithCompletionHandler:^(NSURLSessionWebSocketMessage *msg, NSError *err) {
+    [task receiveMessageWithCompletionHandler:^(NSURLSessionWebSocketMessage * _Nullable msg, NSError * _Nullable err) {
         if (err) { if (g_task == task) { g_ws = 3; g_task = nil; wsConnect(); } return; }
         wsRecv(task);
     }];
@@ -134,7 +142,7 @@ static void wsConnect() {
         if ((g_ws == 2 && g_task && g_task.state == NSURLSessionTaskStateRunning) || g_ws == 1) return;
         g_ws = 1;
         if (g_task) { [g_task cancel]; g_task = nil; }
-        
+
         NSString *url = [NSString stringWithFormat:@"%@/loon?room=ROOM001", MY_WS_BASE];
         if (!g_sess) {
             NSURLSessionConfiguration *c = [NSURLSessionConfiguration defaultSessionConfiguration];
@@ -145,14 +153,13 @@ static void wsConnect() {
         }
         g_task = [g_sess webSocketTaskWithURL:[NSURL URLWithString:url]];
         [g_task resume];
-        
+
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.5 * NSEC_PER_SEC), g_q, ^{
             if (g_task.state == NSURLSessionTaskStateRunning) {
                 g_ws = 2;
-                // 同步给原APP
-                Class cls = objc_getClass("MRCloudRelay");
+                Class cls = objc_getClass(@"MRCloudRelay");
                 id r = ((id(*)(id, SEL))objc_msgSend)(cls, @selector(shared));
-                if (r) setString(r, @selector(setWsTask:), g_task);
+                if (r) setObject(r, @selector(setWsTask:), g_task);
                 wsRecv(g_task);
                 if (!g_hb) {
                     g_hb = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, g_q);
@@ -175,7 +182,7 @@ static void wsSend(NSData *d) {
     dispatch_async(g_q, ^{
         if (g_ws == 2 && g_task && g_task.state == NSURLSessionTaskStateRunning) {
             NSURLSessionWebSocketMessage *m = [[NSURLSessionWebSocketMessage alloc] initWithData:d];
-            [g_task sendMessage:m completionHandler:nil];
+            [g_task sendMessage:m completionHandler:^(NSError * _Nullable error) {}];
         } else {
             bufPush(d);
             if (g_ws == 0 || g_ws == 3) wsConnect();
@@ -193,23 +200,22 @@ static void wsStop() {
 static dispatch_source_t g_refresh = NULL;
 
 static void refreshTimerStart();
+
 static void doRefresh() {
     if (!g_cloud) return;
     NSLog(@"[Hook] 299秒刷新触发");
-    
-    Class cls = objc_getClass("MRCloudRelay");
+
+    Class cls = objc_getClass(@"MRCloudRelay");
     id relay = ((id(*)(id, SEL))objc_msgSend)(cls, @selector(shared));
     if (!relay) { refreshTimerStart(); return; }
-    
-    // 重置原APP状态机，让它以为连接刚建立
+
     setBool(relay, @selector(setWsConnected:), YES);
     setBool(relay, @selector(setWsConnecting:), NO);
     setInt(relay, @selector(setReconnectAttempt:), 0);
-    
-    // 如果ws断了，顺便重连
+
     if (g_ws != 2) wsConnect();
-    
-    refreshTimerStart(); // 循环
+
+    refreshTimerStart();
 }
 
 static void refreshTimerStart() {
@@ -224,9 +230,6 @@ static void refreshTimerStart() {
 static void refreshTimerStop() {
     if (g_refresh) { dispatch_source_cancel(g_refresh); g_refresh = nil; }
 }
-
-// ========== 全局状态 ==========
-static BOOL g_cloud = NO;
 
 // ========== Hook ==========
 
@@ -245,7 +248,6 @@ static void hk_act(id self, SEL _cmd, NSString *card, NSString *mid, id completi
                 saveCard(card, imei);
                 setBool(self, @selector(setIsActivated:), YES);
                 setString(self, @selector(setCardNo:), card);
-                // 自动进主界面
                 UIViewController *vc = [UIApplication sharedApplication].keyWindow.rootViewController;
                 if ([vc isKindOfClass:[UINavigationController class]]) vc = [(UINavigationController*)vc topViewController];
                 while (vc.presentedViewController) vc = vc.presentedViewController;
@@ -262,8 +264,8 @@ static void hk_act(id self, SEL _cmd, NSString *card, NSString *mid, id completi
 
 static BOOL hk_isAct(id self, SEL _cmd) { return g_ok; }
 static id hk_card(id self, SEL _cmd) { return g_card ?: @""; }
-static void hk_startHb(id self, SEL _cmd) {} // 拦截原心跳
-static void hk_stopHb(id self, SEL _cmd) {}  // 拦截原心跳
+static void hk_startHb(id self, SEL _cmd) {}
+static void hk_stopHb(id self, SEL _cmd) {}
 
 // 2. 推流
 static IMP orig_fp = NULL;
@@ -345,7 +347,6 @@ static void hk_mrfetch(id self, SEL _cmd) {
     else if (orig_mrfetch) ((void(*)(id,SEL))orig_mrfetch)(self,_cmd);
 }
 
-// 欺骗状态机
 static id hk_check(id self, SEL _cmd) { return @YES; }
 static void hk_setDisc(id self, SEL _cmd, id t) {}
 static void hk_setHb(id self, SEL _cmd, id t) {}
@@ -368,8 +369,8 @@ static void hk_srs(id self, SEL _cmd) { if (!g_cloud && orig_srs) ((void(*)(id,S
 static void hk_arl(id self, SEL _cmd) { if (!g_cloud && orig_arl) ((void(*)(id,SEL))orig_arl)(self,_cmd); }
 
 static void hk_startStream(id self, SEL _cmd) {
-    Class cls = objc_getClass("MRCloudRelay");
-    id r = ((id(*)(id,SEL))objc_msgSend)(cls, @selector(shared));
+    Class cls = objc_getClass(@"MRCloudRelay");
+    id r = ((id(*)(id, SEL))objc_msgSend)(cls, @selector(shared));
     if (r) hk_open(r, @selector(openSharingWithCompletion:), nil);
 }
 
@@ -382,7 +383,7 @@ static void initHooks() {
     hookMethod("NetworkVerifyClient", @selector(cardNo), (IMP)hk_card, NULL);
     hookMethod("NetworkVerifyClient", @selector(startHeartbeat), (IMP)hk_startHb, NULL);
     hookMethod("NetworkVerifyClient", @selector(stopHeartbeat), (IMP)hk_stopHb, NULL);
-    
+
     hookMethod("MRCloudRelay", @selector(forwardPayload:length:), (IMP)hk_fp, &orig_fp);
     hookMethod("MRCloudRelay", @selector(openSharingWithCompletion:), (IMP)hk_open, &orig_open);
     hookMethod("MRCloudRelay", @selector(closeRoomWithCompletion:), (IMP)hk_close, &orig_close);
@@ -403,17 +404,17 @@ static void initHooks() {
     hookMethod("MRCloudRelay", @selector(setHeartbeatTimer:), (IMP)hk_setHb, NULL);
     hookMethod("MRCloudRelay", @selector(mr_onWebSocketLost), (IMP)hk_lost, NULL);
     hookMethod("MRCloudRelay", @selector(mr_requestCloseRoom:completion:), (IMP)hk_reqClose, &orig_reqClose);
-    
+
     hookMethod("MBWebSocketServer", @selector(send:), (IMP)hk_mbs, &orig_mbs);
     hookMethod("MBWebSocketServer", @selector(sendRawBytes:length:), (IMP)hk_mbr, &orig_mbr);
-    
+
     hookMethod("ViewController", @selector(startHttp), (IMP)hk_sh, &orig_sh);
     hookMethod("ViewController", @selector(startWebSocket), (IMP)hk_sws, &orig_sws);
     hookMethod("ViewController", @selector(startRadarServices), (IMP)hk_srs, &orig_srs);
     hookMethod("ViewController", @selector(activateRadarLink), (IMP)hk_arl, &orig_arl);
     hookMethod("ViewController", @selector(startStreamingWithHardcodedServer), (IMP)hk_startStream, NULL);
     hookMethod("ViewController", @selector(currentStreamWatchUrl), (IMP)hk_curl, NULL);
-    
+
     NSLog(@"[Hook] v17 初始化完成");
 }
 
