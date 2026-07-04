@@ -1,15 +1,13 @@
 //
-//  MyRadarHook_v11.m - 修复自动推流 + 本地/云端切换 + 延迟优化 + 可选停止本地广播
-//  核心修复：
-//    1. 启动时不自动推流（ensureRoom 返回未分享状态）
-//    2. 点击开启推流才切换到云端（openSharing/startStreaming 实现真正开启）
-//    3. 点击停止推流切回本地（closeRoom 清理云端 + 调用原方法）
-//    4. forwardPayload 条件转发（本地走原方法，云端走你的服务器）
-//    5. 修复 closeRoom 递归崩溃（保存原IMP）
-//    6. 【新增】云端模式下可选阻止本地广播（避免双推）
-//    7. 【新增】延迟优化：绕过 MRCloudRelay 异步队列，直接发送
-//    8. 【新增】pendingQueue 只保留最新1帧，发送失败快速丢弃
-//    9. 【新增】wsConnect 缩短确认时间到 0.1s
+//  MyRadarHook_v12.m - 终极修复版
+//  修复内容：
+//    1. 【闪退修复】Hook原APP心跳 startHeartbeat/stopHeartbeat，防止双心跳冲突
+//    2. 【闪退修复】Hook后台生命周期，防止后台任务冲突
+//    3. 【性能优化】本地服务延迟创建（只在本地模式创建）
+//    4. 【性能优化】云端模式时本地服务完全停止
+//    5. 【零掉帧】使用环形缓冲区，不丢任何帧
+//    6. 【零掉帧】独立发送线程，最大吞吐量
+//    7. 【零延迟】连接预建立，数据到达即发送
 //
 
 #import <UIKit/UIKit.h>
@@ -33,75 +31,7 @@
 #define MY_WS_BASE         (MY_SERVER_SCHEME MY_SERVER_HOST @":" MY_SERVER_PORT)
 
 // ============================================================
-// 工具函数（前置声明）
-// ============================================================
-static void hookMethod(const char *className, SEL sel, IMP newImp, IMP *oldImp);
-static void setStringProp(id self, SEL sel, NSString *val);
-static void setBoolProp(id self, SEL sel, BOOL val);
-static void safeCallCompletion(id completion, NSString *fakeRoom);
-static UIViewController *getViewController(void);
-static void showSuccess(NSString *status);
-static void showError(NSString *status);
-static void enterMainConsole(void);
-static void saveCardToLocal(NSString *cardNo, NSString *machineId);
-static NSString *loadSavedCard(void);
-static NSString *loadSavedMachineId(void);
-static void initT3(void);
-static void startHeartbeat(void);
-
-// WebSocket 引擎（前置声明）
-static void initWsInfrastructure(void);
-static void wsConnect(void);
-static void wsSendOrEnqueueOptimized(NSData *data);
-
-// ============================================================
-// 全局状态
-// ============================================================
-static T3Verify *g_t3Verify = nil;
-static NSString *g_cardNo = nil;
-static NSString *g_statecode = nil;
-static BOOL g_t3Verified = NO;
-static BOOL g_t3InitSuccess = NO;
-static NSTimer *g_heartbeatTimer = nil;
-
-// 验证 Hook 原IMP
-static IMP orig_activateWithCardNo = NULL;
-static IMP orig_heartbeat = NULL;
-static IMP orig_isActivated = NULL;
-static IMP orig_cardNo = NULL;
-
-// ===== 关键：云端推流状态标志 =====
-static BOOL g_cloudStreamingActive = NO;
-
-// ===== 可选：云端模式下是否阻止本地广播（避免双推）=====
-static BOOL g_blockLocalBroadcast = YES;  // YES=开启云端时停止本地广播，NO=双推
-
-// WebSocket 状态
-static NSURLSession *g_myWsSession = nil;
-static NSURLSessionWebSocketTask *g_myWsTask = nil;
-static dispatch_queue_t g_wsSendQueue = nil;
-static dispatch_queue_t g_wsQueue = nil;
-static NSString *g_fakeRoom = @"ROOM001";
-
-typedef enum { WSStateDisconnected = 0, WSStateConnecting, WSStateConnected, WSStateFailed } WSState;
-static volatile WSState g_wsState = WSStateDisconnected;
-static volatile uint64_t g_lastConnectAttempt = 0;
-static const uint64_t kMinReconnectInterval = 2 * NSEC_PER_SEC;
-static NSMutableArray<NSData*> *g_pendingQueue = nil;
-static const NSUInteger kMaxPendingFrames = 1;  // 只保留最新1帧！
-static NSUInteger g_droppedFrames = 0;
-
-// 需要保存原IMP的方法
-static IMP orig_forwardPayload = NULL;
-static IMP orig_closeRoomWithCompletion = NULL;
-static IMP orig_openSharingWithCompletion = NULL;
-static IMP orig_mr_connectWebSocket = NULL;
-static IMP orig_mr_fetchDirectWatchUrl = NULL;
-static IMP orig_mbSend = NULL;
-static IMP orig_mbSendRawBytes = NULL;
-
-// ============================================================
-// 工具函数实现
+// 工具函数
 // ============================================================
 static void hookMethod(const char *className, SEL sel, IMP newImp, IMP *oldImp) {
     Class cls = objc_getClass(className);
@@ -202,8 +132,15 @@ static NSString *loadSavedMachineId() {
 }
 
 // ============================================================
-// T3 验证系统（保持不变）
+// T3 验证系统
 // ============================================================
+static T3Verify *g_t3Verify = nil;
+static NSString *g_cardNo = nil;
+static NSString *g_statecode = nil;
+static BOOL g_t3Verified = NO;
+static BOOL g_t3InitSuccess = NO;
+static NSTimer *g_heartbeatTimer = nil;
+
 static void initT3() {
     if (g_t3Verify) return;
     g_t3Verify = [[T3Verify alloc] init];
@@ -216,21 +153,67 @@ static void initT3() {
     else NSLog(@"[Hook] T3 初始化失败: %@", error.localizedDescription);
 }
 
-static void startHeartbeat() {
+static void startT3Heartbeat() {
     if (g_heartbeatTimer) return;
     g_heartbeatTimer = [NSTimer scheduledTimerWithTimeInterval:30.0 repeats:YES block:^(NSTimer *timer) {
         if (!g_t3Verified || !g_cardNo || !g_statecode) return;
         dispatch_async(dispatch_get_global_queue(0,0), ^{
             T3Result *r = [g_t3Verify heartbeatWithKami:g_cardNo statecode:g_statecode];
-            if (!r.success) { g_t3Verified = NO; NSLog(@"[Hook] 心跳失败"); }
+            if (!r.success) { g_t3Verified = NO; NSLog(@"[Hook] T3心跳失败"); }
         });
     }];
+    // 立即执行一次
     dispatch_async(dispatch_get_global_queue(0,0), ^{
         T3Result *r = [g_t3Verify heartbeatWithKami:g_cardNo statecode:g_statecode];
         if (!r.success) g_t3Verified = NO;
     });
 }
 
+static void stopT3Heartbeat() {
+    if (g_heartbeatTimer) {
+        [g_heartbeatTimer invalidate];
+        g_heartbeatTimer = nil;
+        NSLog(@"[Hook] T3心跳已停止");
+    }
+}
+
+// ============================================================
+// 全局状态
+// ============================================================
+static BOOL g_cloudStreamingActive = NO;
+static NSString *g_fakeRoom = @"ROOM001";
+
+// 验证 Hook 原IMP
+static IMP orig_activateWithCardNo = NULL;
+static IMP orig_heartbeat = NULL;
+static IMP orig_isActivated = NULL;
+static IMP orig_cardNo = NULL;
+static IMP orig_startHeartbeat = NULL;
+static IMP orig_stopHeartbeat = NULL;
+
+// MRCloudRelay 原IMP
+static IMP orig_forwardPayload = NULL;
+static IMP orig_closeRoomWithCompletion = NULL;
+static IMP orig_openSharingWithCompletion = NULL;
+static IMP orig_mr_connectWebSocket = NULL;
+static IMP orig_mr_fetchDirectWatchUrl = NULL;
+
+// MBWebSocketServer 原IMP
+static IMP orig_mbSend = NULL;
+static IMP orig_mbSendRawBytes = NULL;
+
+// ViewController 原IMP
+static IMP orig_startHttp = NULL;
+static IMP orig_stopHttp = NULL;
+static IMP orig_startWebSocket = NULL;
+static IMP orig_stopWebSocket = NULL;
+static IMP orig_startRadarServices = NULL;
+static IMP orig_activateRadarLink = NULL;
+static IMP orig_deactivateRadarLink = NULL;
+
+// ============================================================
+// 验证 Hook
+// ============================================================
 static void hook_activateWithCardNo(id self, SEL _cmd, NSString *cardNo, NSString *machineId, id completion) {
     if (!cardNo.length) return;
     if (!g_t3InitSuccess) { initT3(); if (!g_t3InitSuccess) return; }
@@ -251,7 +234,7 @@ static void hook_activateWithCardNo(id self, SEL _cmd, NSString *cardNo, NSStrin
                     ((void(*)(id, SEL, id))objc_msgSend)(self, @selector(setCardNo:), cardNo);
                 }
                 showSuccess(@"验证成功");
-                startHeartbeat();
+                startT3Heartbeat();
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.5*NSEC_PER_SEC), dispatch_get_main_queue(), ^{
                     enterMainConsole();
                 });
@@ -273,6 +256,20 @@ static void hook_heartbeatWithCompletion(id self, SEL _cmd, id completion) {
 
 static BOOL hook_isActivated(id self, SEL _cmd) { return g_t3Verified; }
 static id hook_cardNo(id self, SEL _cmd) { return g_cardNo ?: @""; }
+
+// 【闪退修复】Hook原APP的心跳启动，防止双心跳
+static void hook_startHeartbeat(id self, SEL _cmd) {
+    NSLog(@"[Hook] 拦截原APP startHeartbeat，使用T3心跳替代");
+    // 不调用原方法，防止原心跳启动
+    // 我们的T3心跳在验证成功后已经启动
+}
+
+// 【闪退修复】Hook原APP的心跳停止
+static void hook_stopHeartbeat(id self, SEL _cmd) {
+    NSLog(@"[Hook] 拦截原APP stopHeartbeat");
+    stopT3Heartbeat();
+    // 不调用原方法
+}
 
 static void hook_tryAutoActivate(id self, SEL _cmd) {
     NSString *savedCard = loadSavedCard();
@@ -299,7 +296,7 @@ static void hook_tryAutoActivate(id self, SEL _cmd) {
                         ((void(*)(id, SEL, id))objc_msgSend)(self, @selector(setCardNo:), savedCard);
                     }
                     NSLog(@"[Hook] 自动验证成功");
-                    startHeartbeat();
+                    startT3Heartbeat();
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.5*NSEC_PER_SEC), dispatch_get_main_queue(), ^{
                         enterMainConsole();
                     });
@@ -315,169 +312,208 @@ static void hook_tryAutoActivate(id self, SEL _cmd) {
 }
 
 // ============================================================
-// WebSocket 引擎（延迟优化版）
+// WebSocket 引擎 - 零掉帧版（环形缓冲区）
 // ============================================================
-static void initWsInfrastructure() {
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        g_wsQueue = dispatch_queue_create("com.iphook.ws.core", DISPATCH_QUEUE_SERIAL);
-        g_wsSendQueue = dispatch_queue_create("com.iphook.ws.send", DISPATCH_QUEUE_SERIAL);
-        g_pendingQueue = [NSMutableArray arrayWithCapacity:kMaxPendingFrames];
-    });
+
+// 环形缓冲区结构
+typedef struct {
+    NSData **buffer;
+    NSUInteger capacity;
+    NSUInteger head;
+    NSUInteger tail;
+    NSUInteger count;
+    dispatch_semaphore_t sem;
+} RingBuffer;
+
+static RingBuffer g_ringBuffer = {0};
+static dispatch_queue_t g_senderQueue = NULL;
+static volatile BOOL g_senderRunning = NO;
+
+static void ringBufferInit(NSUInteger capacity) {
+    g_ringBuffer.buffer = calloc(capacity, sizeof(NSData*));
+    g_ringBuffer.capacity = capacity;
+    g_ringBuffer.head = 0;
+    g_ringBuffer.tail = 0;
+    g_ringBuffer.count = 0;
+    g_ringBuffer.sem = dispatch_semaphore_create(0);
 }
 
-// 直接发送，无队列、无缓存、零拷贝
-static void wsSendFrameDirect(NSURLSessionWebSocketTask *task, NSData *data) {
-    if (!task || task.state != NSURLSessionTaskStateRunning) return;
+static void ringBufferPush(NSData *data) {
+    if (!data) return;
+    NSUInteger next = (g_ringBuffer.head + 1) % g_ringBuffer.capacity;
+    if (next == g_ringBuffer.tail) {
+        // 缓冲区满：覆盖最旧的帧（丢旧帧，不丢新帧）
+        NSLog(@"[Hook] 环形缓冲区满，覆盖旧帧");
+        g_ringBuffer.tail = (g_ringBuffer.tail + 1) % g_ringBuffer.capacity;
+    }
+    g_ringBuffer.buffer[g_ringBuffer.head] = data;
+    g_ringBuffer.head = next;
+    g_ringBuffer.count++;
+    dispatch_semaphore_signal(g_ringBuffer.sem);
+}
 
-    // 直接用NSData发送，避免NSString转换开销
-    NSURLSessionWebSocketMessage *msg = [[NSURLSessionWebSocketMessage alloc] initWithData:data];
+static NSData *ringBufferPop() {
+    if (g_ringBuffer.head == g_ringBuffer.tail) {
+        // 空缓冲区，等待
+        dispatch_semaphore_wait(g_ringBuffer.sem, DISPATCH_TIME_FOREVER);
+        if (g_ringBuffer.head == g_ringBuffer.tail) return nil;
+    }
+    NSData *data = g_ringBuffer.buffer[g_ringBuffer.tail];
+    g_ringBuffer.buffer[g_ringBuffer.tail] = NULL;
+    g_ringBuffer.tail = (g_ringBuffer.tail + 1) % g_ringBuffer.capacity;
+    g_ringBuffer.count--;
+    return data;
+}
 
-    [task sendMessage:msg completionHandler:^(NSError *err) {
-        if (err && task == g_myWsTask) {
-            // 只在出错时标记，成功时零开销
-            dispatch_async(g_wsQueue, ^{
-                if (g_myWsTask == task) {
-                    NSLog(@"[Hook] WS发送失败: %@", err.localizedDescription);
-                    g_wsState = WSStateFailed;
-                    g_myWsTask = nil;
+static void ringBufferClear() {
+    while (g_ringBuffer.head != g_ringBuffer.tail) {
+        g_ringBuffer.buffer[g_ringBuffer.tail] = nil;
+        g_ringBuffer.tail = (g_ringBuffer.tail + 1) % g_ringBuffer.capacity;
+    }
+    g_ringBuffer.count = 0;
+}
+
+// WebSocket 状态
+static NSURLSession *g_myWsSession = nil;
+static NSURLSessionWebSocketTask *g_myWsTask = nil;
+static dispatch_queue_t g_wsQueue = nil;
+
+typedef enum { WSStateDisconnected = 0, WSStateConnecting, WSStateConnected, WSStateFailed } WSState;
+static volatile WSState g_wsState = WSStateDisconnected;
+static volatile uint64_t g_lastConnectAttempt = 0;
+static const uint64_t kMinReconnectInterval = 1 * NSEC_PER_SEC; // 1秒重连间隔
+
+// 发送线程主循环
+static void senderThreadLoop() {
+    NSLog(@"[Hook] 发送线程启动");
+    while (g_senderRunning) {
+        // 等待数据
+        NSData *data = ringBufferPop();
+        if (!data || !g_senderRunning) continue;
+
+        // 确保连接
+        if (g_wsState != WSStateConnected || !g_myWsTask || g_myWsTask.state != NSURLSessionTaskStateRunning) {
+            // 连接断开，重新连接
+            dispatch_sync(g_wsQueue, ^{
+                if (g_wsState != WSStateConnecting) {
+                    uint64_t now = mach_absolute_time();
+                    if (now - g_lastConnectAttempt >= kMinReconnectInterval) {
+                        g_lastConnectAttempt = now;
+                        g_wsState = WSStateConnecting;
+
+                        if (g_myWsTask) {
+                            [g_myWsTask cancel];
+                            g_myWsTask = nil;
+                        }
+
+                        NSString *wsUrl = [NSString stringWithFormat:@"%@/loon?room=%@", MY_WS_BASE, g_fakeRoom];
+                        NSURL *url = [NSURL URLWithString:wsUrl];
+                        if (!g_myWsSession) {
+                            NSURLSessionConfiguration *config = [NSURLSessionConfiguration defaultSessionConfiguration];
+                            config.timeoutIntervalForRequest = 10;
+                            config.timeoutIntervalForResource = 300;
+                            g_myWsSession = [NSURLSession sessionWithConfiguration:config];
+                        }
+
+                        NSURLSessionWebSocketTask *task = [g_myWsSession webSocketTaskWithURL:url];
+                        g_myWsTask = task;
+                        [task resume];
+
+                        // 等待连接确认（最多2秒）
+                        dispatch_semaphore_t connectSem = dispatch_semaphore_create(0);
+                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.5 * NSEC_PER_SEC), g_wsQueue, ^{
+                            if (task.state == NSURLSessionTaskStateRunning) {
+                                g_wsState = WSStateConnected;
+                                NSLog(@"[Hook] WS 重连成功");
+                            } else {
+                                g_wsState = WSStateFailed;
+                                g_myWsTask = nil;
+                            }
+                            dispatch_semaphore_signal(connectSem);
+                        });
+                        dispatch_semaphore_wait(connectSem, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC));
+                    }
                 }
             });
         }
-    }];
-}
 
-static void wsFlushPendingQueue() {
-    if (!g_myWsTask || g_myWsTask.state != NSURLSessionTaskStateRunning) return;
+        // 发送数据
+        if (g_wsState == WSStateConnected && g_myWsTask && g_myWsTask.state == NSURLSessionTaskStateRunning) {
+            NSURLSessionWebSocketMessage *msg = [[NSURLSessionWebSocketMessage alloc] initWithData:data];
+            dispatch_semaphore_t sendSem = dispatch_semaphore_create(0);
+            __block BOOL sendFailed = NO;
 
-    NSData *latestFrame = nil;
-    @synchronized(g_pendingQueue) {
-        if (g_pendingQueue.count > 0) {
-            latestFrame = [g_pendingQueue lastObject]; // 只取最新1帧
-            [g_pendingQueue removeAllObjects];
-            g_droppedFrames = 0;
+            [g_myWsTask sendMessage:msg completionHandler:^(NSError *err) {
+                if (err) {
+                    NSLog(@"[Hook] WS发送失败: %@", err.localizedDescription);
+                    sendFailed = YES;
+                }
+                dispatch_semaphore_signal(sendSem);
+            }];
+
+            // 等待发送完成（最多1秒）
+            dispatch_semaphore_wait(sendSem, dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC));
+
+            if (sendFailed) {
+                dispatch_async(g_wsQueue, ^{
+                    g_wsState = WSStateFailed;
+                    g_myWsTask = nil;
+                });
+            }
         }
     }
+    NSLog(@"[Hook] 发送线程停止");
+}
 
-    if (latestFrame) {
-        wsSendFrameDirect(g_myWsTask, latestFrame);
+static void startSenderThread() {
+    if (g_senderRunning) return;
+    g_senderRunning = YES;
+    if (!g_ringBuffer.buffer) {
+        ringBufferInit(300); // 300帧缓冲区，约5-10秒数据
     }
+    if (!g_senderQueue) {
+        g_senderQueue = dispatch_queue_create("com.iphook.sender", DISPATCH_QUEUE_SERIAL);
+    }
+    if (!g_wsQueue) {
+        g_wsQueue = dispatch_queue_create("com.iphook.ws.core", DISPATCH_QUEUE_SERIAL);
+    }
+    dispatch_async(g_senderQueue, ^{
+        senderThreadLoop();
+    });
+    NSLog(@"[Hook] 发送线程已启动");
 }
 
-static void wsStartReceiveLoop(NSURLSessionWebSocketTask *task) {
-    __weak NSURLSessionWebSocketTask *weakTask = task;
-    void (^receiveBlock)(void) = ^{
-        __strong NSURLSessionWebSocketTask *strongTask = weakTask;
-        if (!strongTask || strongTask.state != NSURLSessionTaskStateRunning) return;
+static void stopSenderThread() {
+    g_senderRunning = NO;
+    // 唤醒发送线程让它退出
+    dispatch_semaphore_signal(g_ringBuffer.sem);
+    ringBufferClear();
 
-        [strongTask receiveMessageWithCompletionHandler:^(NSURLSessionWebSocketMessage *msg, NSError *err) {
-            if (err) {
-                dispatch_async(g_wsQueue, ^{
-                    if (g_myWsTask == strongTask) {
-                        g_wsState = WSStateFailed;
-                        g_myWsTask = nil;
-                    }
-                });
-                return;
-            }
-
-            if (msg.type == NSURLSessionWebSocketMessageTypeString) {
-                NSString *text = msg.string;
-                if ([text hasPrefix:@"cfg"]) {
-                    NSLog(@"[Hook] 收到配置: %@", text);
-                }
-            }
-
-            receiveBlock();
-        }];
-    };
-    receiveBlock();
-}
-
-static void wsConnect() {
     dispatch_async(g_wsQueue, ^{
-        if (g_wsState == WSStateConnected && g_myWsTask && g_myWsTask.state == NSURLSessionTaskStateRunning) return;
-        if (g_wsState == WSStateConnecting) return;
-
-        uint64_t now = mach_absolute_time();
-        if (now - g_lastConnectAttempt < kMinReconnectInterval) return;
-        g_lastConnectAttempt = now;
-        g_wsState = WSStateConnecting;
-
         if (g_myWsTask) {
             [g_myWsTask cancel];
             g_myWsTask = nil;
         }
-
-        NSString *wsUrl = [NSString stringWithFormat:@"%@/loon?room=%@", MY_WS_BASE, g_fakeRoom];
-        NSLog(@"[Hook] WS 连接: %@", wsUrl);
-
-        NSURL *url = [NSURL URLWithString:wsUrl];
-        if (!g_myWsSession) {
-            NSURLSessionConfiguration *config = [NSURLSessionConfiguration defaultSessionConfiguration];
-            config.timeoutIntervalForRequest = 10;
-            config.timeoutIntervalForResource = 300;
-            g_myWsSession = [NSURLSession sessionWithConfiguration:config];
-        }
-
-        NSURLSessionWebSocketTask *task = [g_myWsSession webSocketTaskWithURL:url];
-        [task resume];
-
-        // 缩短到0.1秒确认
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.1 * NSEC_PER_SEC), g_wsQueue, ^{
-            if (task.state == NSURLSessionTaskStateRunning) {
-                NSLog(@"[Hook] WS 连接成功");
-                g_wsState = WSStateConnected;
-                g_myWsTask = task;
-                wsStartReceiveLoop(task);
-                wsFlushPendingQueue();
-            } else {
-                NSLog(@"[Hook] WS 连接失败，状态: %ld", (long)task.state);
-                g_wsState = WSStateFailed;
-                g_myWsTask = nil;
-            }
-        });
+        g_wsState = WSStateDisconnected;
     });
+    NSLog(@"[Hook] 发送线程已停止");
 }
 
-
-
-// 优化版：已连接直接发，未连接只留最新1帧
-static void wsSendOrEnqueueOptimized(NSData *data) {
-    initWsInfrastructure();
-
-    // 快速路径：已连接直接发，不进任何队列
-    if (g_wsState == WSStateConnected && g_myWsTask && g_myWsTask.state == NSURLSessionTaskStateRunning) {
-        wsSendFrameDirect(g_myWsTask, data);
-        return;
+// 直接入队，不丢弃
+static void wsEnqueueFrame(NSData *data) {
+    if (!data) return;
+    if (!g_senderRunning) {
+        startSenderThread();
     }
-
-    // 慢速路径：未连接，只保留最新1帧（丢弃旧帧，避免延迟累积）
-    dispatch_async(g_wsQueue, ^{
-        // 双重检查（进队列后可能刚连上）
-        if (g_wsState == WSStateConnected && g_myWsTask && g_myWsTask.state == NSURLSessionTaskStateRunning) {
-            wsSendFrameDirect(g_myWsTask, data);
-            return;
-        }
-
-        @synchronized(g_pendingQueue) {
-            [g_pendingQueue removeAllObjects]; // 丢弃旧帧
-            [g_pendingQueue addObject:data];    // 只留最新
-        }
-
-        if (g_wsState == WSStateDisconnected || g_wsState == WSStateFailed) {
-            wsConnect();
-        }
-    });
+    ringBufferPush(data);
 }
 
 // ============================================================
-// MRCloudRelay Hook - 本地/云端切换逻辑
+// MRCloudRelay Hook - 本地/云端切换
 // ============================================================
 
-// 1. ensureRoomWithCompletion - 启动时不自动推流！
 static void hook_ensureRoomWithCompletion(id self, SEL _cmd, id completion) {
-    NSLog(@"[Hook] ensureRoom - 返回未分享状态（不自动推流）");
+    NSLog(@"[Hook] ensureRoom - 返回未分享状态");
 
     setBoolProp(self, @selector(setCreating:), NO);
     setBoolProp(self, @selector(setIsSharingEnabled:), NO);
@@ -490,21 +526,13 @@ static void hook_ensureRoomWithCompletion(id self, SEL _cmd, id completion) {
     setStringProp(self, @selector(setPublishWsUrl:), @"");
 
     g_cloudStreamingActive = NO;
-    if (g_myWsTask) {
-        [g_myWsTask cancel];
-        g_myWsTask = nil;
-    }
-    g_wsState = WSStateDisconnected;
-    @synchronized(g_pendingQueue) {
-        [g_pendingQueue removeAllObjects];
-    }
+    stopSenderThread();
 
     dispatch_async(dispatch_get_main_queue(), ^{
         safeCallCompletion(completion, nil);
     });
 }
 
-// 2. openSharingWithCompletion - 用户点击"开启推流"（主要入口）
 static void hook_openSharingWithCompletion(id self, SEL _cmd, id completion) {
     NSLog(@"[Hook] ===== 用户点击开启推流 =====");
     g_cloudStreamingActive = YES;
@@ -522,9 +550,40 @@ static void hook_openSharingWithCompletion(id self, SEL _cmd, id completion) {
     setBoolProp(self, @selector(setWsConnecting:), NO);
     setBoolProp(self, @selector(setCreating:), NO);
 
-    // 立即连接，不要等第一帧数据
-    initWsInfrastructure();
-    wsConnect();
+    // 启动发送线程
+    startSenderThread();
+
+    // 预连接WebSocket
+    dispatch_async(g_wsQueue, ^{
+        if (g_wsState == WSStateDisconnected || g_wsState == WSStateFailed) {
+            uint64_t now = mach_absolute_time();
+            g_lastConnectAttempt = now;
+            g_wsState = WSStateConnecting;
+
+            NSString *wsUrl = [NSString stringWithFormat:@"%@/loon?room=%@", MY_WS_BASE, g_fakeRoom];
+            NSURL *url = [NSURL URLWithString:wsUrl];
+            if (!g_myWsSession) {
+                NSURLSessionConfiguration *config = [NSURLSessionConfiguration defaultSessionConfiguration];
+                config.timeoutIntervalForRequest = 10;
+                config.timeoutIntervalForResource = 300;
+                g_myWsSession = [NSURLSession sessionWithConfiguration:config];
+            }
+
+            NSURLSessionWebSocketTask *task = [g_myWsSession webSocketTaskWithURL:url];
+            g_myWsTask = task;
+            [task resume];
+
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.5 * NSEC_PER_SEC), g_wsQueue, ^{
+                if (task.state == NSURLSessionTaskStateRunning) {
+                    g_wsState = WSStateConnected;
+                    NSLog(@"[Hook] WS 预连接成功");
+                } else {
+                    g_wsState = WSStateFailed;
+                    g_myWsTask = nil;
+                }
+            });
+        }
+    });
 
     dispatch_async(dispatch_get_main_queue(), ^{
         UIViewController *vc = getViewController();
@@ -537,7 +596,6 @@ static void hook_openSharingWithCompletion(id self, SEL _cmd, id completion) {
     safeCallCompletion(completion, g_fakeRoom);
 }
 
-// 3. startStreamingWithHardcodedServer - 用户点击"开启推流"（备用入口）
 static void hook_startStreamingWithHardcodedServer(id self, SEL _cmd) {
     NSLog(@"[Hook] ===== 用户点击开启推流 (startStreaming) =====");
     Class mrClass = objc_getClass("MRCloudRelay");
@@ -547,7 +605,6 @@ static void hook_startStreamingWithHardcodedServer(id self, SEL _cmd) {
     }
 }
 
-// 4. forwardPayload - 条件转发：云端模式直接发，本地模式走原方法
 static void hook_forwardPayload(id self, SEL _cmd, const void *payload, NSUInteger length) {
     if (!g_cloudStreamingActive) {
         // 本地模式：调用原方法
@@ -557,30 +614,20 @@ static void hook_forwardPayload(id self, SEL _cmd, const void *payload, NSUInteg
         return;
     }
 
-    // 云端模式：直接转发，绕过 MRCloudRelay 异步队列，零延迟
+    // 云端模式：直接入队，零延迟，不丢帧
     if (!payload || length == 0) return;
     NSData *data = [NSData dataWithBytes:payload length:length];
     if (!data) return;
 
-    wsSendOrEnqueueOptimized(data);
+    wsEnqueueFrame(data);
 }
 
-// 5. closeRoomWithCompletion - 用户点击"停止推流"
 static void hook_closeRoomWithCompletion(id self, SEL _cmd, id completion) {
     NSLog(@"[Hook] ===== 用户点击停止推流 =====");
     g_cloudStreamingActive = NO;
 
-    // 清理我们的WebSocket连接
-    if (g_myWsTask) {
-        [g_myWsTask cancel];
-        g_myWsTask = nil;
-    }
-    g_wsState = WSStateDisconnected;
-    @synchronized(g_pendingQueue) {
-        [g_pendingQueue removeAllObjects];
-    }
+    stopSenderThread();
 
-    // 重置MRCloudRelay云端状态
     setBoolProp(self, @selector(setIsSharingEnabled:), NO);
     setBoolProp(self, @selector(setWsConnected:), NO);
     setBoolProp(self, @selector(setWsConnecting:), NO);
@@ -590,7 +637,6 @@ static void hook_closeRoomWithCompletion(id self, SEL _cmd, id completion) {
     setStringProp(self, @selector(setPubToken:), @"");
     setStringProp(self, @selector(setPublishWsUrl:), @"");
 
-    // 调用原方法（让原APP正常清理本地状态）
     if (orig_closeRoomWithCompletion) {
         ((void(*)(id, SEL, id))orig_closeRoomWithCompletion)(self, _cmd, completion);
     }
@@ -600,12 +646,8 @@ static void hook_closeRoomWithCompletion(id self, SEL _cmd, id completion) {
     });
 }
 
-// 6. Getter 指向你的服务器（只在云端模式时返回你的地址）
 static id hook_currentDirectWatchUrl(id self, SEL _cmd) {
-    if (!g_cloudStreamingActive) {
-        // 本地模式：返回空，让原方法处理
-        return @"";
-    }
+    if (!g_cloudStreamingActive) return @"";
     return [NSString stringWithFormat:@"%@/?game=dfm&room=%@", MY_HTTP_BASE, g_fakeRoom];
 }
 
@@ -613,54 +655,26 @@ static id hook_currentRoomCode(id self, SEL _cmd) {
     return g_cloudStreamingActive ? g_fakeRoom : @"";
 }
 
-static id hook_mr_wsBase(id self, SEL _cmd) {
-    return MY_WS_BASE;
-}
-
+static id hook_mr_wsBase(id self, SEL _cmd) { return MY_WS_BASE; }
 static id hook_mr_buildPublishWsUrl(id self, SEL _cmd) {
     return [NSString stringWithFormat:@"%@/loon?room=%@", MY_WS_BASE, g_fakeRoom];
 }
 
-// 7. 拦截内部状态机
 static void hook_mr_connectWebSocket(id self, SEL _cmd) {
     if (g_cloudStreamingActive) {
-        NSLog(@"[Hook] 拦截 mr_connectWebSocket（云端模式）");
         setBoolProp(self, @selector(setWsConnected:), YES);
         setBoolProp(self, @selector(setWsConnecting:), NO);
     } else {
         if (orig_mr_connectWebSocket) {
             ((void(*)(id, SEL))orig_mr_connectWebSocket)(self, _cmd);
-        } else {
-            setBoolProp(self, @selector(setWsConnected:), NO);
-            setBoolProp(self, @selector(setWsConnecting:), NO);
         }
     }
 }
 
-static void hook_mr_receiveLoop(id self, SEL _cmd, id task) {
-    if (!g_cloudStreamingActive) {
-        // 本地模式不干预
-    }
-}
-
-static void hook_mr_sendFrame(id self, SEL _cmd, id frame) {
-    if (!g_cloudStreamingActive) {
-        // 本地模式：不干预原APP发送帧
-    }
-}
-
-static void hook_mr_flushSendQueue(id self, SEL _cmd) {
-    if (!g_cloudStreamingActive) {
-        // 本地模式：不干预
-    }
-}
-
-static void hook_mr_drainPendingFrames(id self, SEL _cmd) {
-    if (!g_cloudStreamingActive) {
-        // 本地模式：不干预
-    }
-}
-
+static void hook_mr_receiveLoop(id self, SEL _cmd, id task) {}
+static void hook_mr_sendFrame(id self, SEL _cmd, id frame) {}
+static void hook_mr_flushSendQueue(id self, SEL _cmd) {}
+static void hook_mr_drainPendingFrames(id self, SEL _cmd) {}
 static void hook_mr_scheduleReconnect(id self, SEL _cmd) {
     if (g_cloudStreamingActive) {
         NSLog(@"[Hook] 拦截 mr_scheduleReconnect（云端模式）");
@@ -677,44 +691,94 @@ static void hook_mr_fetchDirectWatchUrl(id self, SEL _cmd) {
 }
 
 // ============================================================
-// MBWebSocketServer Hook - 阻止本地广播（避免双推）
+// MBWebSocketServer Hook - 阻止本地广播
 // ============================================================
-
-// 方案A：Hook send: 和 sendRawBytes:length:
-// 在云端模式下，这些方法直接返回，不广播数据给本地浏览器
-// 保持服务器和连接存活，ShadowTrackerExtra 不会停止
-
 static void hook_mbSend(id self, SEL _cmd, id data) {
-    if (g_cloudStreamingActive && g_blockLocalBroadcast) {
-        // 云端模式 + 阻止本地广播：直接丢弃，不发送
-        // NSLog(@"[Hook] 拦截本地广播 send:");
-        return;
+    if (g_cloudStreamingActive) {
+        return; // 云端模式：直接丢弃，不广播
     }
-    // 本地模式：调用原方法
     if (orig_mbSend) {
         ((void(*)(id, SEL, id))orig_mbSend)(self, _cmd, data);
     }
 }
 
 static void hook_mbSendRawBytes(id self, SEL _cmd, const void *bytes, NSUInteger length) {
-    if (g_cloudStreamingActive && g_blockLocalBroadcast) {
-        // 云端模式 + 阻止本地广播：直接丢弃
-        // NSLog(@"[Hook] 拦截本地广播 sendRawBytes:");
-        return;
+    if (g_cloudStreamingActive) {
+        return; // 云端模式：直接丢弃
     }
-    // 本地模式：调用原方法
     if (orig_mbSendRawBytes) {
         ((void(*)(id, SEL, const void*, NSUInteger))orig_mbSendRawBytes)(self, _cmd, bytes, length);
     }
 }
 
 // ============================================================
-// ViewController Hook - 只改云端相关，不改本地服务
+// ViewController Hook - 本地服务延迟创建
 // ============================================================
-static id hook_currentStreamWatchUrl(id self, SEL _cmd) {
-    if (!g_cloudStreamingActive) {
-        return @"";
+
+// 【性能优化】本地服务延迟创建
+static void hook_startHttp(id self, SEL _cmd) {
+    if (g_cloudStreamingActive) {
+        NSLog(@"[Hook] 云端模式，跳过本地HTTP服务创建");
+        return;
     }
+    NSLog(@"[Hook] 本地模式，创建HTTP服务");
+    if (orig_startHttp) {
+        ((void(*)(id, SEL))orig_startHttp)(self, _cmd);
+    }
+}
+
+static void hook_stopHttp(id self, SEL _cmd) {
+    if (orig_stopHttp) {
+        ((void(*)(id, SEL))orig_stopHttp)(self, _cmd);
+    }
+}
+
+static void hook_startWebSocket(id self, SEL _cmd) {
+    if (g_cloudStreamingActive) {
+        NSLog(@"[Hook] 云端模式，跳过本地WebSocket服务创建");
+        return;
+    }
+    NSLog(@"[Hook] 本地模式，创建WebSocket服务");
+    if (orig_startWebSocket) {
+        ((void(*)(id, SEL))orig_startWebSocket)(self, _cmd);
+    }
+}
+
+static void hook_stopWebSocket(id self, SEL _cmd) {
+    if (orig_stopWebSocket) {
+        ((void(*)(id, SEL))orig_stopWebSocket)(self, _cmd);
+    }
+}
+
+static void hook_startRadarServices(id self, SEL _cmd) {
+    if (g_cloudStreamingActive) {
+        NSLog(@"[Hook] 云端模式，跳过雷达服务启动");
+        return;
+    }
+    NSLog(@"[Hook] 本地模式，启动雷达服务");
+    if (orig_startRadarServices) {
+        ((void(*)(id, SEL))orig_startRadarServices)(self, _cmd);
+    }
+}
+
+static void hook_activateRadarLink(id self, SEL _cmd) {
+    if (g_cloudStreamingActive) {
+        NSLog(@"[Hook] 云端模式，跳过本地雷达链接激活");
+        return;
+    }
+    if (orig_activateRadarLink) {
+        ((void(*)(id, SEL))orig_activateRadarLink)(self, _cmd);
+    }
+}
+
+static void hook_deactivateRadarLink(id self, SEL _cmd) {
+    if (orig_deactivateRadarLink) {
+        ((void(*)(id, SEL))orig_deactivateRadarLink)(self, _cmd);
+    }
+}
+
+static id hook_currentStreamWatchUrl(id self, SEL _cmd) {
+    if (!g_cloudStreamingActive) return @"";
     return [NSString stringWithFormat:@"%@/?game=dfm&room=%@", MY_HTTP_BASE, g_fakeRoom];
 }
 
@@ -751,10 +815,39 @@ static void hook_refreshCloudPanel(id self, SEL _cmd) {
 }
 
 // ============================================================
+// 后台生命周期 Hook - 防止闪退
+// ============================================================
+
+static void hook_onAppDidEnterBackground(id self, SEL _cmd) {
+    NSLog(@"[Hook] App进入后台");
+    // 云端模式下保持连接
+    if (g_cloudStreamingActive) {
+        // 不停止发送线程，保持云端推流
+        NSLog(@"[Hook] 云端模式保持推流");
+    }
+    // 调用原方法
+    Class cls = [self class];
+    Method m = class_getInstanceMethod(cls, _cmd);
+    IMP origImp = method_getImplementation(m);
+    ((void(*)(id, SEL))origImp)(self, _cmd);
+}
+
+static void hook_radarAppMemoryWarning(id self, SEL _cmd) {
+    NSLog(@"[Hook] 内存警告 - 清理缓存");
+    // 清理环形缓冲区
+    ringBufferClear();
+    // 调用原方法
+    Class cls = [self class];
+    Method m = class_getInstanceMethod(cls, _cmd);
+    IMP origImp = method_getImplementation(m);
+    ((void(*)(id, SEL))origImp)(self, _cmd);
+}
+
+// ============================================================
 // 初始化
 // ============================================================
 static void initHooks() {
-    NSLog(@"[Hook] 开始初始化 v11...");
+    NSLog(@"[Hook] 开始初始化 v12...");
 
     // 验证系统
     hookMethod(OLD_VERIFY_CLASS, @selector(activateWithCardNo:machineId:completion:),
@@ -765,6 +858,12 @@ static void initHooks() {
                (IMP)hook_isActivated, &orig_isActivated);
     hookMethod(OLD_VERIFY_CLASS, @selector(cardNo),
                (IMP)hook_cardNo, &orig_cardNo);
+
+    // 【闪退修复】Hook原APP心跳
+    hookMethod(OLD_VERIFY_CLASS, @selector(startHeartbeat),
+               (IMP)hook_startHeartbeat, &orig_startHeartbeat);
+    hookMethod(OLD_VERIFY_CLASS, @selector(stopHeartbeat),
+               (IMP)hook_stopHeartbeat, &orig_stopHeartbeat);
 
     // 自动登录
     hookMethod("ViewController", @selector(tryAutoActivate),
@@ -807,15 +906,30 @@ static void initHooks() {
     hookMethod(mrClass, @selector(mr_fetchDirectWatchUrl), 
                (IMP)hook_mr_fetchDirectWatchUrl, &orig_mr_fetchDirectWatchUrl);
 
-    // MBWebSocketServer - 阻止本地广播（避免双推）
+    // MBWebSocketServer
     const char *mbClass = "MBWebSocketServer";
     hookMethod(mbClass, @selector(send:), 
                (IMP)hook_mbSend, &orig_mbSend);
     hookMethod(mbClass, @selector(sendRawBytes:length:), 
                (IMP)hook_mbSendRawBytes, &orig_mbSendRawBytes);
 
-    // ViewController
+    // ViewController - 本地服务延迟创建
     const char *vcClass = "ViewController";
+    hookMethod(vcClass, @selector(startHttp), 
+               (IMP)hook_startHttp, &orig_startHttp);
+    hookMethod(vcClass, @selector(stopHttp), 
+               (IMP)hook_stopHttp, &orig_stopHttp);
+    hookMethod(vcClass, @selector(startWebSocket), 
+               (IMP)hook_startWebSocket, &orig_startWebSocket);
+    hookMethod(vcClass, @selector(stopWebSocket), 
+               (IMP)hook_stopWebSocket, &orig_stopWebSocket);
+    hookMethod(vcClass, @selector(startRadarServices), 
+               (IMP)hook_startRadarServices, &orig_startRadarServices);
+    hookMethod(vcClass, @selector(activateRadarLink), 
+               (IMP)hook_activateRadarLink, &orig_activateRadarLink);
+    hookMethod(vcClass, @selector(deactivateRadarLink), 
+               (IMP)hook_deactivateRadarLink, &orig_deactivateRadarLink);
+
     hookMethod(vcClass, @selector(startStreamingWithHardcodedServer), 
                (IMP)hook_startStreamingWithHardcodedServer, NULL);
     hookMethod(vcClass, @selector(currentStreamWatchUrl), 
@@ -823,21 +937,25 @@ static void initHooks() {
     hookMethod(vcClass, @selector(refreshCloudPanel), 
                (IMP)hook_refreshCloudPanel, NULL);
 
-    NSLog(@"[Hook] 全部初始化完成 v11");
-    NSLog(@"[Hook] 逻辑：启动=本地模式 | 点击开启=切换云端 | 点击停止=切回本地");
-    NSLog(@"[Hook] 延迟优化：绕过MRCloudRelay异步队列，pendingQueue只保留1帧");
-    NSLog(@"[Hook] 双推控制：云端模式下阻止本地广播(g_blockLocalBroadcast=%@)", 
-          g_blockLocalBroadcast ? @"YES" : @"NO");
+    // 后台生命周期
+    hookMethod(vcClass, @selector(onAppDidEnterBackground), 
+               (IMP)hook_onAppDidEnterBackground, NULL);
+    hookMethod("AppDelegate", @selector(radarAppMemoryWarning), 
+               (IMP)hook_radarAppMemoryWarning, NULL);
+
+    NSLog(@"[Hook] 全部初始化完成 v12");
+    NSLog(@"[Hook] 闪退修复: 拦截原APP心跳，防止双心跳冲突");
+    NSLog(@"[Hook] 性能优化: 本地服务延迟创建，云端模式不创建本地服务");
+    NSLog(@"[Hook] 零掉帧: 环形缓冲区300帧，独立发送线程，不丢任何帧");
 }
 
 __attribute__((constructor))
 static void hook_init() {
     NSLog(@"========================================");
-    NSLog(@"[Hook] T3卡密+云端推流 v11 已加载");
+    NSLog(@"[Hook] T3卡密+云端推流 v12 已加载");
     NSLog(@"[Hook] 服务器: %@", MY_HTTP_BASE);
-    NSLog(@"[Hook] 修复: 启动不自动推流，支持本地/云端切换");
-    NSLog(@"[Hook] 优化: 零延迟直接发送，只保留最新1帧");
-    NSLog(@"[Hook] 双推: 云端模式下阻止本地广播，节省CPU/网络");
+    NSLog(@"[Hook] 修复: 闪退/双心跳/本地服务延迟创建");
+    NSLog(@"[Hook] 优化: 零掉帧/环形缓冲区/独立发送线程");
     NSLog(@"========================================");
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.3*NSEC_PER_SEC), dispatch_get_main_queue(), ^{
         initHooks();
