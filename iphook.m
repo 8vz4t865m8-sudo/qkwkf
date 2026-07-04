@@ -381,7 +381,16 @@ static const uint64_t kMinReconnectInterval = 1 * NSEC_PER_SEC; // 1秒重连间
 static void senderThreadLoop() {
     NSLog(@"[Hook] 发送线程启动");
     while (g_senderRunning) {
-        // 等待数据
+        // 【后台保活】检测APP状态，后台时暂停发送，避免系统杀进程
+        UIApplicationState appState = [UIApplication sharedApplication].applicationState;
+        if (appState == UIApplicationStateBackground) {
+            // 后台模式：清空缓冲区，休眠等待，不消耗CPU
+            ringBufferClear();
+            [NSThread sleepForTimeInterval:0.5]; // 500ms休眠
+            continue;
+        }
+
+        // 前台模式：正常发送
         NSData *data = ringBufferPop();
         if (!data || !g_senderRunning) continue;
 
@@ -812,30 +821,7 @@ static void hook_refreshCloudPanel(id self, SEL _cmd) {
 // 后台生命周期 Hook - 防止闪退
 // ============================================================
 
-static void hook_onAppDidEnterBackground(id self, SEL _cmd) {
-    NSLog(@"[Hook] App进入后台");
-    // 云端模式下保持连接
-    if (g_cloudStreamingActive) {
-        // 不停止发送线程，保持云端推流
-        NSLog(@"[Hook] 云端模式保持推流");
-    }
-    // 调用原方法
-    Class cls = [self class];
-    Method m = class_getInstanceMethod(cls, _cmd);
-    IMP origImp = method_getImplementation(m);
-    ((void(*)(id, SEL))origImp)(self, _cmd);
-}
 
-static void hook_radarAppMemoryWarning(id self, SEL _cmd) {
-    NSLog(@"[Hook] 内存警告 - 清理缓存");
-    // 清理环形缓冲区
-    ringBufferClear();
-    // 调用原方法
-    Class cls = [self class];
-    Method m = class_getInstanceMethod(cls, _cmd);
-    IMP origImp = method_getImplementation(m);
-    ((void(*)(id, SEL))origImp)(self, _cmd);
-}
 
 // ============================================================
 // 初始化
@@ -932,10 +918,6 @@ static void initHooks() {
                (IMP)hook_refreshCloudPanel, NULL);
 
     // 后台生命周期
-    hookMethod(vcClass, @selector(onAppDidEnterBackground), 
-               (IMP)hook_onAppDidEnterBackground, NULL);
-    hookMethod("AppDelegate", @selector(radarAppMemoryWarning), 
-               (IMP)hook_radarAppMemoryWarning, NULL);
 
     NSLog(@"[Hook] 全部初始化完成 v12");
     NSLog(@"[Hook] 闪退修复: 拦截原APP心跳，防止双心跳冲突");
