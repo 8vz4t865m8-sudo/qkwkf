@@ -493,7 +493,7 @@ static void wsConnect() {
         if (!g_myWsSession) {
             NSURLSessionConfiguration *config = [NSURLSessionConfiguration defaultSessionConfiguration];
             config.timeoutIntervalForRequest = 10;
-            config.timeoutIntervalForResource = 300;
+            config.timeoutIntervalForResource = 0;
             g_myWsSession = [NSURLSession sessionWithConfiguration:config];
         }
 
