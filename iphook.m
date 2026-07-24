@@ -1,7 +1,6 @@
 //
-//  iphook.m - 适配14-26系统版 T3验证替换（安全版）
-//
-// 注意：去掉了自动填充输入框的功能，避免闪退
+//  iphook.m - 卡密验证替换精简版
+// 只做验证替换，无其他功能，最稳定
 //
 
 #import <UIKit/UIKit.h>
@@ -10,7 +9,7 @@
 #import "T3Verify.h"
 
 // ============================================================
-// ⚙️ T3 配置
+// ⚙️ T3 验证参数（改成你自己的）
 // ============================================================
 
 #define T3_LOGIN_CODE      @"B9F97729EC64A6C9"
@@ -25,32 +24,30 @@
                            "U0sEt6p3P7lCc3JkPwIDAQAB\n" \
                            "-----END PUBLIC KEY-----"
 
-// 可能的验证类名（挨个试）
-#define AUTH_CLASS_1 "WWWActivation"
-#define AUTH_CLASS_2 "NetworkVerifyClient"
+// 验证类名（这个软件是 WWWActivation）
+#define AUTH_CLASS_NAME    "WWWActivation"
 
-#define SAVED_CARD_KEY @"com.kfun.savedCard"
-
-// ============================================================
-// 📦 全局状态
-// ============================================================
-
-static T3Verify *g_t3Verify = nil;
-static NSString *g_cardNo = nil;
-static NSString *g_statecode = nil;
-static BOOL g_t3Verified = NO;
-static BOOL g_t3InitSuccess = NO;
-static NSTimer *g_heartbeatTimer = nil;
+// 保存卡密的key
+#define SAVED_CARD_KEY     @"com.kfun.savedCardNo"
 
 // ============================================================
-// 💾 卡密保存
+// 📦 全局变量
 // ============================================================
 
-static void saveCard(NSString *card) {
-    if (!card) return;
-    [[NSUserDefaults standardUserDefaults] setObject:card forKey:SAVED_CARD_KEY];
+static T3Verify *g_t3 = nil;
+static NSString *g_card = nil;
+static NSString *g_state = nil;
+static BOOL g_verified = NO;
+static NSTimer *g_timer = nil;
+
+// ============================================================
+// 💾 卡密保存读取
+// ============================================================
+
+static void saveCard(NSString *c) {
+    if (!c) return;
+    [[NSUserDefaults standardUserDefaults] setObject:c forKey:SAVED_CARD_KEY];
     [[NSUserDefaults standardUserDefaults] synchronize];
-    NSLog(@"[IPHook] 卡密已保存");
 }
 
 static NSString *loadCard() {
@@ -58,250 +55,151 @@ static NSString *loadCard() {
 }
 
 // ============================================================
-// 🚀 T3 初始化
+// 🚀 初始化 T3
 // ============================================================
 
 static void initT3() {
-    if (g_t3Verify) return;
+    if (g_t3) return;
     
-    g_t3Verify = [[T3Verify alloc] init];
-    NSError *error = nil;
-    
-    BOOL ok = [g_t3Verify initRsaWithLoginCode:T3_LOGIN_CODE
-                                    noticeCode:T3_NOTICE_CODE
-                                   versionCode:T3_VERSION_CODE
-                                 heartbeatCode:T3_HEARTBEAT_CODE
-                                        appkey:T3_APPKEY
-                                  rsaPublicKey:T3_RSA_PUBLIC_KEY
-                                         error:&error];
-    
-    g_t3InitSuccess = ok;
-    NSLog(@"[IPHook] T3初始化: %@", ok ? @"成功" : @"失败");
+    g_t3 = [[T3Verify alloc] init];
+    NSError *err = nil;
+    [g_t3 initRsaWithLoginCode:T3_LOGIN_CODE
+                    noticeCode:T3_NOTICE_CODE
+                   versionCode:T3_VERSION_CODE
+                 heartbeatCode:T3_HEARTBEAT_CODE
+                        appkey:T3_APPKEY
+                  rsaPublicKey:T3_RSA_PUBLIC_KEY
+                         error:&err];
 }
 
 // ============================================================
 // 💓 心跳
 // ============================================================
 
-static void startHeartbeat() {
-    if (g_heartbeatTimer) return;
+static void startHeart() {
+    if (g_timer) return;
     
-    g_heartbeatTimer = [NSTimer scheduledTimerWithTimeInterval:30 repeats:YES block:^(NSTimer *t) {
-        if (!g_t3Verified || !g_cardNo || !g_statecode) return;
+    g_timer = [NSTimer scheduledTimerWithTimeInterval:30 repeats:YES block:^(NSTimer *t) {
+        if (!g_verified || !g_card || !g_state) return;
         dispatch_async(dispatch_get_global_queue(0, 0), ^{
-            [g_t3Verify heartbeatWithKami:g_cardNo statecode:g_statecode];
+            [g_t3 heartbeatWithKami:g_card statecode:g_state];
         });
     }];
 }
 
 // ============================================================
-// 🎯 执行 T3 验证
+// 🎯 执行验证
 // ============================================================
 
-static void doVerify(NSString *code, id completion) {
-    if (!code || code.length == 0) {
-        NSLog(@"[IPHook] 卡密为空");
-        return;
-    }
+static void doVerify(NSString *code, void (^completion)(BOOL, NSError *)) {
+    if (!code || code.length == 0) return;
     
-    if (!g_t3InitSuccess) {
-        initT3();
-        if (!g_t3InitSuccess) return;
-    }
+    initT3();
     
-    g_cardNo = code;
+    g_card = code;
     NSString *imei = [T3Verify getMachineCode];
     
     dispatch_async(dispatch_get_global_queue(0, 0), ^{
         
-        T3LoginResult *result = [g_t3Verify loginWithKami:code imei:imei];
+        T3LoginResult *r = [g_t3 loginWithKami:code imei:imei];
         
         dispatch_async(dispatch_get_main_queue(), ^{
             
-            if (result.success) {
-                NSLog(@"[IPHook] ✓ 验证成功");
-                g_t3Verified = YES;
-                g_statecode = result.statecode;
+            if (r.success) {
+                g_verified = YES;
+                g_state = r.statecode;
                 saveCard(code);
-                startHeartbeat();
+                startHeart();
                 
-                // 调用成功回调
-                if (completion) {
-                    typedef void (*CompletionBlock)(BOOL success, id error);
-                    CompletionBlock cb = (__bridge CompletionBlock)completion;
-                    cb(YES, nil);
-                }
-                
+                if (completion) completion(YES, nil);
             } else {
-                NSLog(@"[IPHook] ✗ 验证失败: %@", result.error);
-                g_t3Verified = NO;
-                g_statecode = nil;
+                g_verified = NO;
+                g_state = nil;
                 
-                if (completion) {
-                    typedef void (*CompletionBlock)(BOOL success, id error);
-                    CompletionBlock cb = (__bridge CompletionBlock)completion;
-                    cb(NO, result.error);
-                }
+                if (completion) completion(NO, r.error);
             }
         });
     });
 }
 
 // ============================================================
-// 🎣 Hook: activateCode:completion: （核心验证方法）
+// 🎣 Hook 1: activateCode:completion: （点验证按钮时调用）
 // ============================================================
 
-static void hook_activateCode(id self, SEL _cmd, NSString *code, id completion) {
-    NSLog(@"[IPHook] 拦截 activateCode: %@", code);
+static void hook_activateCode(id self, SEL _cmd, NSString *code, void (^completion)(BOOL, NSError *)) {
+    NSLog(@"[Hook] 拦截验证: %@", code);
     
-    // 如果卡密为空，试试用保存的
+    // 如果输入为空，试试用保存的卡密
     if (!code || code.length == 0) {
         NSString *saved = loadCard();
-        if (saved.length > 0) {
-            code = saved;
-            NSLog(@"[IPHook] 使用保存的卡密");
-        }
+        if (saved) code = saved;
     }
     
     doVerify(code, completion);
 }
 
 // ============================================================
-// 🎣 Hook: verifyWithCompletion:
+// 🎣 Hook 2: verifyWithCompletion: （其他地方调用验证）
 // ============================================================
 
-static void hook_verifyWithCompletion(id self, SEL _cmd, id completion) {
-    NSLog(@"[IPHook] 拦截 verifyWithCompletion");
-    
-    NSString *saved = loadCard();
-    if (saved.length > 0 && g_t3Verified) {
-        // 已经验证过了，直接返回成功
-        if (completion) {
-            typedef void (*CompletionBlock)(BOOL success, id error);
-            CompletionBlock cb = (__bridge CompletionBlock)completion;
-            cb(YES, nil);
-        }
+static void hook_verify(id self, SEL _cmd, void (^completion)(BOOL, NSError *)) {
+    if (g_verified) {
+        if (completion) completion(YES, nil);
         return;
     }
     
-    if (saved.length > 0) {
+    NSString *saved = loadCard();
+    if (saved) {
         doVerify(saved, completion);
     }
 }
 
 // ============================================================
-// 🎣 Hook: 是否已激活
+// 🎣 Hook 3: 是否已激活
 // ============================================================
 
 static BOOL hook_isActivated(id self, SEL _cmd) {
-    return g_t3Verified;
+    return g_verified;
 }
 
 // ============================================================
-// 🎣 推流模块修复（card_no / machine_id）
-// ============================================================
-
-static NSString *fake_cardNo(id self, SEL _cmd) {
-    return g_cardNo ?: @"CARD_000000000000";
-}
-
-static NSString *fake_machineId(id self, SEL _cmd) {
-    return @"MACHINE_000000000000";
-}
-
-static void initPushStreamHooks() {
-    NSArray *classes = @[@"MRCloudRelay", @"MRStreamer", @"MRPushManager", @"CloudRelay", @"MRRoomManager", @"MRApiClient"];
-    
-    for (NSString *name in classes) {
-        Class cls = objc_getClass(name.UTF8String);
-        if (!cls) continue;
-        
-        unsigned int count;
-        Method *methods = class_copyMethodList(cls, &count);
-        
-        for (int i = 0; i < count; i++) {
-            SEL sel = method_getName(methods[i]);
-            NSString *selName = NSStringFromSelector(sel);
-            const char *type = method_getTypeEncoding(methods[i]);
-            
-            if (([selName containsString:@"cardNo"] || [selName containsString:@"card_no"])
-                && type && strstr(type, "@")) {
-                class_addMethod(cls, sel, (IMP)fake_cardNo, "@@:");
-            }
-            
-            if (([selName containsString:@"machineId"] || [selName containsString:@"machine_id"])
-                && type && strstr(type, "@")) {
-                class_addMethod(cls, sel, (IMP)fake_machineId, "@@:");
-            }
-        }
-        
-        free(methods);
-    }
-}
-
-// ============================================================
-// 🔌 初始化所有 Hook
-// ============================================================
-
-static void initHooks() {
-    NSLog(@"[IPHook] 开始初始化...");
-    
-    initT3();
-    
-    // 尝试多个可能的验证类名
-    const char *classNames[] = { AUTH_CLASS_1, AUTH_CLASS_2, NULL };
-    
-    for (int i = 0; classNames[i]; i++) {
-        Class cls = objc_getClass(classNames[i]);
-        if (!cls) {
-            NSLog(@"[IPHook] 类不存在: %s", classNames[i]);
-            continue;
-        }
-        
-        NSLog(@"[IPHook] 找到验证类: %s", classNames[i]);
-        
-        // Hook activateCode:completion:
-        Method m1 = class_getInstanceMethod(cls, @selector(activateCode:completion:));
-        if (m1) {
-            method_setImplementation(m1, (IMP)hook_activateCode);
-            NSLog(@"[IPHook] ✓ Hook activateCode:completion:");
-        }
-        
-        // Hook verifyWithCompletion:
-        Method m2 = class_getInstanceMethod(cls, @selector(verifyWithCompletion:));
-        if (m2) {
-            method_setImplementation(m2, (IMP)hook_verifyWithCompletion);
-            NSLog(@"[IPHook] ✓ Hook verifyWithCompletion:");
-        }
-        
-        // Hook isActivated（如果有的话）
-        Method m3 = class_getInstanceMethod(cls, @selector(isActivated));
-        if (m3) {
-            method_setImplementation(m3, (IMP)hook_isActivated);
-            NSLog(@"[IPHook] ✓ Hook isActivated");
-        }
-        
-        break; // 找到一个就够了
-    }
-    
-    // 推流模块修复
-    initPushStreamHooks();
-    
-    NSLog(@"[IPHook] 初始化完成");
-}
-
-// ============================================================
-// 🚪 入口
+// 🔌 安装 Hook
 // ============================================================
 
 __attribute__((constructor))
-static void iphook_init() {
-    NSLog(@"========================================");
-    NSLog(@"[IPHook] 已加载 (14-26系统适配版)");
-    NSLog(@"========================================");
+static void entry() {
+    NSLog(@"[Hook] 卡密验证替换已加载");
     
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), 
                    dispatch_get_main_queue(), ^{
-        initHooks();
+        
+        Class cls = objc_getClass(AUTH_CLASS_NAME);
+        if (!cls) {
+            NSLog(@"[Hook] 找不到类: %s", AUTH_CLASS_NAME);
+            return;
+        }
+        
+        // Hook 激活方法
+        Method m1 = class_getInstanceMethod(cls, @selector(activateCode:completion:));
+        if (m1) {
+            method_setImplementation(m1, (IMP)hook_activateCode);
+            NSLog(@"[Hook] ✓ activateCode:completion:");
+        }
+        
+        // Hook 验证方法
+        Method m2 = class_getInstanceMethod(cls, @selector(verifyWithCompletion:));
+        if (m2) {
+            method_setImplementation(m2, (IMP)hook_verify);
+            NSLog(@"[Hook] ✓ verifyWithCompletion:");
+        }
+        
+        // Hook 激活状态
+        Method m3 = class_getInstanceMethod(cls, @selector(isActivated));
+        if (m3) {
+            method_setImplementation(m3, (IMP)hook_isActivated);
+            NSLog(@"[Hook] ✓ isActivated");
+        }
+        
+        NSLog(@"[Hook] 完成");
     });
 }
